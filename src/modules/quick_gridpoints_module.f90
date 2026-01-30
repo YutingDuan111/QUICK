@@ -280,7 +280,7 @@ module quick_gridpoints_module
     idx_grid = 0
     do Iatm=1,natom
       if (quick_method%iSG == 1) then
-         Iradtemp = 50
+         Iradtemp = quick_method%Iradtemp  ! Use value from input file
          call gridformEML(Iradtemp)
       else if (quick_method%iSG == 2) then
          Iradtemp = 75
@@ -298,15 +298,14 @@ module quick_gridpoints_module
 
       do Irad = 1, Iradtemp
             if(quick_method%iSG == 1)then
-               call gridformSG1Angular(iatm,RGRID(Irad),iiang)
-               !call gridformLBDAngular(iiang,Iradtemp)
+               !call gridformSG1Angular(iatm,RGRID(Irad),iiang)
+               call gridformLBDAngular(iiang,Iradtemp,quick_method%lebedev_type)
                rad = radii(quick_molspec%iattype(iatm))
             else if(quick_method%iSG == 0)then
                call gridformSG0(iatm,Iradtemp+1-Irad,iiang,RGRID,RWT)
                rad = radii2(quick_molspec%iattype(iatm))
             else if(quick_method%iSG == 2)then
                call gridformSG2Angular(quick_molspec%iattype(iatm),Irad,iiang)
-               !call gridformLBDAngular(iiang,Iradtemp)
                rad = radii(quick_molspec%iattype(iatm))
             else if(quick_method%iSG == 3)then
                call gridformSG3Angular(quick_molspec%iattype(iatm),Irad,iiang)
@@ -1482,10 +1481,10 @@ module quick_gridpoints_module
    end subroutine gridformSG3Angular
 
 
-   subroutine gridformLBDAngular(iiang,eml_nradial)
+   subroutine gridformLBDAngular(iiang,eml_nradial,lebedev_type)
       use allmod
       implicit double precision(a-h,o-z)
-      integer, intent(in) :: eml_nradial
+      integer, intent(in) :: eml_nradial, lebedev_type
       integer, intent(out) :: iiang
       integer :: I, N
 
@@ -1500,9 +1499,45 @@ module quick_gridpoints_module
       select case(eml_nradial)
       
          case(50)
-            ! unpruned SG-1 style: 194 angular points
-            CALL LD0194(XANG, YANG, ZANG, WTANG, N)
-            iiang = 194
+            select case(lebedev_type)
+               case(6)
+                  CALL LD0006(XANG, YANG, ZANG, WTANG, N)
+                  iiang=6
+               case(26)
+                  CALL LD0026(XANG, YANG, ZANG, WTANG, N)
+                  iiang=26
+               case(38)
+                  CALL LD0038(XANG, YANG, ZANG, WTANG, N)
+                  iiang=38
+               case(50)
+                  CALL LD0050(XANG, YANG, ZANG, WTANG, N)
+                  iiang=50
+               case(74)
+                  CALL LD0074(XANG, YANG, ZANG, WTANG, N)
+                  iiang=74
+               case(86)
+                  CALL LD0086(XANG, YANG, ZANG, WTANG, N)
+                  iiang=86
+               case(110)
+                  CALL LD0110(XANG, YANG, ZANG, WTANG, N)
+                  iiang=110
+               case(146)
+                  CALL LD0146(XANG, YANG, ZANG, WTANG, N)
+                  iiang=146
+               case(170)
+                  CALL LD0170(XANG, YANG, ZANG, WTANG, N)
+                  iiang=170
+               case(194)
+                  CALL LD0194(XANG, YANG, ZANG, WTANG, N)
+                  iiang=194
+               case(230)
+                  CALL LD0230(XANG, YANG, ZANG, WTANG, N)
+                  iiang=230
+               case default
+                  ! Fallback to 194 for SG-1
+                  CALL LD0194(XANG, YANG, ZANG, WTANG, N)
+                  iiang=194
+            end select
             
          case(75)
             ! unpruned SG-2 style: 302 angular points
@@ -1515,10 +1550,9 @@ module quick_gridpoints_module
             iiang = 590
             
          case default
-            ! Fallback: use 302 points (unpruned SG-2 default)
-            CALL LD0302(XANG, YANG, ZANG, WTANG, N)
-            iiang = 302
-            
+            ! Fallback: use 194 angular points
+            CALL LD0194(XANG, YANG, ZANG, WTANG, N)
+            iiang = 194
       end select
    
    

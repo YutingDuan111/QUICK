@@ -92,7 +92,11 @@ module quick_method_module
         integer :: ifragbasis = 1      ! =2.residue basis,=1.atom basis(DEFUALT),=3 non-h atom basis
 
         ! this is DFT grid
-        integer :: iSG = 3             ! =0. SG0, =1. SG1, =2. SG2, =3. SG3(DEFAULT)
+        integer :: iSG = 1             ! =0. SG0, =1. SG1, =2. SG2, =3. SG3(DEFAULT)
+
+        ! EML grid customization
+        integer :: Iradtemp = 50       ! Number of radial points for EML grid (default: 50)
+        integer :: lebedev_type = 194  ! Number of angular points for EML grid (default: 194)
 
         ! Initial guess part
         logical :: SAD = .true.        ! SAD initial guess(default)
@@ -268,6 +272,8 @@ module quick_method_module
             call MPI_BCAST(self%MFCC,1,mpi_logical,0,MPI_COMM_WORLD,mpierror)
             call MPI_BCAST(self%ifragbasis,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
             call MPI_BCAST(self%iSG,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
+            call MPI_BCAST(self%Iradtemp,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
+            call MPI_BCAST(self%lebedev_type,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
             call MPI_BCAST(self%iscf,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
             call MPI_BCAST(self%iscf_sad,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
             call MPI_BCAST(self%iopt,1,mpi_integer,0,MPI_COMM_WORLD,mpierror)
@@ -721,8 +727,17 @@ module quick_method_module
                 else if (index(keyWD,'SG3').ne.0) then
                     self%iSG=3
                 else
-                    self%iSG=3  ! default SG-3
+                    self%iSG=1  ! default SG-1
                     ! this line will cover other definition
+                endif
+                
+                ! Parse custom EML grid parameters
+                if (index(keyWD,'IRADTEMP').ne.0) then
+                    call read(keywd, 'IRADTEMP', self%Iradtemp)
+                endif
+                
+                if (index(keyWD,'LEBEDEV_TYPE').ne.0) then
+                    call read(keywd, 'LEBEDEV_TYPE', self%lebedev_type)
                 endif
             endif
 
