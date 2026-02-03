@@ -1500,9 +1500,9 @@ module quick_gridpoints_module
       
          case(50)
             select case(lebedev_type)
-               case(6)
-                  CALL LD0006(XANG, YANG, ZANG, WTANG, N)
-                  iiang=6
+               case(14)
+                  CALL LD0014(XANG, YANG, ZANG, WTANG, N)
+                  iiang=14
                case(26)
                   CALL LD0026(XANG, YANG, ZANG, WTANG, N)
                   iiang=26
@@ -1533,6 +1533,9 @@ module quick_gridpoints_module
                case(230)
                   CALL LD0230(XANG, YANG, ZANG, WTANG, N)
                   iiang=230
+               case(266)
+                  CALL LD0266(XANG, YANG, ZANG, WTANG, N)
+                  iiang=266
                case default
                   ! Fallback to 194 for SG-1
                   CALL LD0194(XANG, YANG, ZANG, WTANG, N)
