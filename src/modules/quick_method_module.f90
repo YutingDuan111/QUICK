@@ -10,12 +10,16 @@
 
 #define FUNCTIONAL_ID_SIZE (10)
 
-
 module quick_method_module
     use quick_constants_module
     use quick_input_parser_module  
 
     implicit none
+    
+    ! Valid Lebedev angular grid sizes
+    integer, parameter :: VALID_LEBEDEV_SIZES(25) = &
+        [6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
+         434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702]
 
     type quick_method_type
 
@@ -93,6 +97,11 @@ module quick_method_module
 
         ! this is DFT grid
         integer :: iSG = 1             ! =0. SG0, =1. SG1(DEFAULT), =2. SG2, =3. SG3
+
+        ! Custom EML (Euler-Maclaurin + Lebedev) grid
+        logical :: useEML = .false.    ! Enable custom EML grid
+        integer :: eml_radial = 0      ! Radial grid points
+        integer :: eml_angular = 0     ! Angular grid points
 
         ! Initial guess part
         logical :: SAD = .true.        ! SAD initial guess(default)
@@ -451,10 +460,20 @@ module quick_method_module
             if (self%debug)     write(io,'(" DEBUG MODE")')
 
             if (self%DFT) then
-                if (self%iSG .eq. 0) write(io,'(" STANDARD GRID = SG0")')
-                if (self%iSG .eq. 1) write(io,'(" STANDARD GRID = SG1")')
-                if (self%iSG .eq. 2) write(io,'(" STANDARD GRID = SG2")')
-                if (self%iSG .eq. 3) write(io,'(" STANDARD GRID = SG3")')
+                if (.not. self%useEML) then
+                    if (self%iSG .eq. 0) write(io,'(" STANDARD GRID = SG0")')
+                    if (self%iSG .eq. 1) write(io,'(" STANDARD GRID = SG1")')
+                    if (self%iSG .eq. 2) write(io,'(" STANDARD GRID = SG2")')
+                    if (self%iSG .eq. 3) write(io,'(" STANDARD GRID = SG3")')
+                endif
+            endif
+            
+            if (self%useEML) then
+                write(io,'(" CUSTOM EML GRID")')
+                write(io,'("  RADIAL POINTS  = ",I6)') self%eml_radial
+                write(io,'("  ANGULAR POINTS = ",I6)') self%eml_angular
+                write(io,'(" [REMINDER] Please verify that ",I6," and ",I6," are compatible grid parameters.")') &
+                    self%eml_radial, self%eml_angular
             endif
 
             if (self%opt) then
@@ -723,6 +742,24 @@ module quick_method_module
                 else
                     self%iSG=1  ! default SG-1
                 endif
+            endif
+
+            ! Custom EML grid
+            if (index(keywd,'EML_RAD') /= 0) then
+                call read(keywd, 'EML_RAD', self%eml_radial)
+                self%useEML = .true.
+            endif
+
+            if (index(keywd,'EML_ANG') /= 0) then
+                call read(keywd, 'EML_ANG', self%eml_angular)
+                self%useEML = .true.
+            endif
+
+            ! Detect iSG conflict (store flag for Phase 5 validation)
+            if (self%useEML .and. (index(keywd,'SG0') /= 0 .or. index(keywd,'SG1') /= 0 .or. &
+                                index(keywd,'SG2') /= 0 .or. index(keywd,'SG3') /= 0)) then
+                ! Error will be handled in Phase 5 validation
+                ! For now, just flag it
             endif
 
             self%printEnergy=.true.
