@@ -17,10 +17,13 @@ module quick_method_module
     implicit none
     
     ! Valid Lebedev angular grid sizes
-    integer, parameter :: VALID_LEBEDEV_SIZES(25) = &
-        [6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
-         434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702]
-
+    !integer, parameter :: VALID_LEBEDEV_SIZES(25) = &
+    !    [6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
+    !     434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702]
+    integer, parameter :: N_VALID_LEBEDEV = 25
+    integer, parameter :: VALID_LEBEDEV_SIZES(N_VALID_LEBEDEV) = (/ &
+    6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
+    434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702 /)
     type quick_method_type
 
         ! the first section includes some elements of namelist is for the QM method that is going to use
