@@ -1633,8 +1633,8 @@ module quick_gridpoints_module
          call LD2702(XANG, YANG, ZANG, WTANG, N)
          iiang = 2702
       case default
-         call LD0302(XANG, YANG, ZANG, WTANG, N)
-         iiang = 302
+         call LD0194(XANG, YANG, ZANG, WTANG, N)
+         iiang = 194
    end select
    
       !  The Lebedev weights are returned normalized to 1.  

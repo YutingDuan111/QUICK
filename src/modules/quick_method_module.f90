@@ -17,13 +17,11 @@ module quick_method_module
     implicit none
     
     ! Valid Lebedev angular grid sizes
-    !integer, parameter :: VALID_LEBEDEV_SIZES(25) = &
-    !    [6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
-    !     434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702]
     integer, parameter :: N_VALID_LEBEDEV = 25
     integer, parameter :: VALID_LEBEDEV_SIZES(N_VALID_LEBEDEV) = (/ &
     6, 14, 26, 38, 50, 74, 86, 110, 146, 170, 194, 230, 266, 302, 350, &
     434, 590, 770, 974, 1202, 1454, 1730, 2030, 2354, 2702 /)
+
     type quick_method_type
 
         ! the first section includes some elements of namelist is for the QM method that is going to use
@@ -475,8 +473,16 @@ module quick_method_module
                 write(io,'(" CUSTOM EML GRID")')
                 write(io,'("  RADIAL POINTS  = ",I6)') self%eml_radial
                 write(io,'("  ANGULAR POINTS = ",I6)') self%eml_angular
-                write(io,'(" [REMINDER] Please verify that ",I6," and ",I6," are compatible grid parameters.")') &
-                    self%eml_radial, self%eml_angular
+                ! check EML input 
+                if (self%eml_radial < 50) then
+                    write(io,'(" [REMINDER] Radial points < 50 may be too small to effect output accuracy.")')
+                else if (self%eml_radial >= 50 .and. self%eml_radial < 75 .and. self%eml_angular < 194) then
+                    write(io,'(" [REMINDER] For radial points 50-75, angular points should be >= 194 for good accuracy.")')
+                else if (self%eml_radial >= 75 .and. self%eml_radial < 99 .and. self%eml_angular < 302) then
+                    write(io,'(" [REMINDER] For radial points 75-99, angular points should be >= 302 for good accuracy.")')
+                else if (self%eml_radial >= 99 .and. self%eml_angular < 590) then
+                    write(io,'(" [REMINDER] For radial points >= 99, angular points should be >= 590 for good accuracy.")')
+                endif
             endif
 
             if (self%opt) then
@@ -917,6 +923,31 @@ module quick_method_module
                self%extgrid_angstrom=.true.
                self%ext_grid=.true.
            endif
+
+            ! Validate EML parameters if EML grid is enabled
+            if (self%useEML) then
+                
+                ! Check if eml_angular is in VALID_LEBEDEV_SIZES
+                if (self%eml_angular > 0) then
+                    if (.not. any(VALID_LEBEDEV_SIZES == self%eml_angular)) then
+                        call PrtErr(OUTFILEHANDLE, 'ERROR: Invalid EML_ANG value provided.')
+                        call quick_exit(OUTFILEHANDLE, 43)
+                    endif
+                endif
+                
+                ! Check for iSG conflict
+                if (index(keywd,'SG0') /= 0 .or. index(keywd,'SG1') /= 0 .or. &
+                    index(keywd,'SG2') /= 0 .or. index(keywd,'SG3') /= 0) then
+                    call PrtErr(OUTFILEHANDLE, 'ERROR: EML grid conflicts with standard grid selection.')
+                    call quick_exit(OUTFILEHANDLE, 44)
+                endif
+                
+                ! Validate eml_radial > 0
+                if (self%eml_radial <= 0) then
+                    call PrtErr(OUTFILEHANDLE, 'ERROR: EML_RAD <= 0')
+                    call quick_exit(OUTFILEHANDLE, 45)
+                endif
+            endif
         end subroutine read_quick_method
 
 
