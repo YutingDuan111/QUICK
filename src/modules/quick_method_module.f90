@@ -473,16 +473,7 @@ module quick_method_module
                 write(io,'(" CUSTOM EML GRID")')
                 write(io,'("  RADIAL POINTS  = ",I6)') self%eml_radial
                 write(io,'("  ANGULAR POINTS = ",I6)') self%eml_angular
-                ! check EML input 
-                if (self%eml_radial < 50) then
-                    write(io,'(" [REMINDER] Radial points < 50 may be too small to effect output accuracy.")')
-                else if (self%eml_radial >= 50 .and. self%eml_radial < 75 .and. self%eml_angular < 194) then
-                    write(io,'(" [REMINDER] For radial points 50-75, angular points should be >= 194 for good accuracy.")')
-                else if (self%eml_radial >= 75 .and. self%eml_radial < 99 .and. self%eml_angular < 302) then
-                    write(io,'(" [REMINDER] For radial points 75-99, angular points should be >= 302 for good accuracy.")')
-                else if (self%eml_radial >= 99 .and. self%eml_angular < 590) then
-                    write(io,'(" [REMINDER] For radial points >= 99, angular points should be >= 590 for good accuracy.")')
-                endif
+                write(io,'(" [REMINDER] Radial points and angular points choice may effect output accuracy.")')
             endif
 
             if (self%opt) then

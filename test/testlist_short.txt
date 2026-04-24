@@ -13,6 +13,8 @@ ene_psb3_blyp_631g_sg2
 ene_psb3_blyp_631g_sg3
 ene_wat_blyp_631g_sg2		    
 ene_wat_blyp_631g_sg3
+ene_psb3_blyp_631g_eml
+ene_wat_blyp_631g_eml
 grad_psb3_b3lyp_631g                #PSB3: DFT gradient test: s and p basis functions
 grad_NaCl_b3lyp_def2svp             #NaCl: DFT gradient test: DEF2-SVP basis set
 grad_CH4_pbe0_6311g2df2pd           #CH4: DFT gradient test: s, p, d and f basis functions
