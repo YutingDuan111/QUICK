@@ -40,14 +40,14 @@
 | If you have any comments or queries, please reach out to us on GitHub issues or discussion sections:     
 | https://github.com/merzlab/QUICK.                                                                        
 |                                                                                                          
-| TASK STARTS ON: Fri Apr 24 13:56:13 2026
+| TASK STARTS ON: Fri May  1 16:49:00 2026
 | INPUT FILE :    ene_psb3_blyp_631g_eml.in
 | OUTPUT FILE:    ene_psb3_blyp_631g_eml.out
 | BASIS SET PATH: /Users/duanyuting/quick_install/basis
 
  @ Read Job And Atom
 
-  KEYWORD=BLYP BASIS=6-31G CUTOFF=1.0E-9 DENSERMS=1.0E-6  ZMAKE ENERGY DIPOLE CHARGE=+1 DFT EML_RAD=75 EML_ANG=266 BLYP 6-31G
+  KEYWORD=BLYP BASIS=6-31G CUTOFF=1.0E-9 DENSERMS=1.0E-6  ZMAKE ENERGY DIPOLE CHARGE=+1 DFT EML_RAD=73 EML_ANG=302
  ============== JOB CARD =============
  METHOD = DENSITY FUNCTIONAL THEORY
  USING LIBXC VERSION: 4.3.4
@@ -62,8 +62,8 @@
  Z-MATRIX CONSTRUCTION
  DIPOLE
  CUSTOM EML GRID
-  RADIAL POINTS  =     75
-  ANGULAR POINTS =    266
+  RADIAL POINTS  =     73
+  ANGULAR POINTS =    302
  [REMINDER] Radial points and angular points choice may effect output accuracy.
  MAX SCF CYCLES =    200
  MAX DIIS CYCLES =   10
@@ -166,10 +166,10 @@
 
  OCTAGO: OCTree Algorithm for Grid Operations 
    PRUNING CUTOFF       = 0.100E-06
-   INITIAL GRID POINTS  =      279300
-|   FINAL GRID POINTS    =      176603
-|   SIGNIFICANT NUMBER OF BASIS FUNCTIONS     =      128997
-|   SIGNIFICANT NUMBER OF PRIMITIVE FUNCTIONS =      161272
+   INITIAL GRID POINTS  =      308644
+|   FINAL GRID POINTS    =      209109
+|   SIGNIFICANT NUMBER OF BASIS FUNCTIONS     =      151505
+|   SIGNIFICANT NUMBER OF PRIMITIVE FUNCTIONS =      189446
 
  @ End XC Quadrature Formation
 
@@ -180,27 +180,27 @@
 | ------------------------------------------------------------------------------------------------------------------------
 | NCYC       ENERGY         DELTA_E      SCF_TIME  DII_CYC   DII_TIME   O_TIME  DIAG_TIME    MAX_ERR    RMS_CHG    MAX_CHG
 | ------------------------------------------------------------------------------------------------------------------------
-|  1   -251.912940951      ------         0.699     1        0.00      0.70      0.00    0.2182E+01  0.5710E-01  0.5617E+00
-|  2   -250.840737744  -.107220E+01       0.771     2        0.00      0.77      0.00    0.1783E+00  0.3769E-01  0.4617E+00
-|  3   -250.261402498  -.579335E+00       0.766     3        0.00      0.77      0.00    0.3192E+00  0.3406E-01  0.4488E+00
-|  4   -250.924241059  0.662839E+00       0.768     4        0.00      0.77      0.00    0.1832E+00  0.1302E-01  0.2010E+00
-|  5   -251.040292729  0.116052E+00       0.760     5        0.00      0.76      0.00    0.5021E-01  0.4375E-02  0.6980E-01
-|  6   -251.052565116  0.122724E-01       0.752     6        0.00      0.75      0.00    0.2662E-01  0.1612E-02  0.2467E-01
-|  7   -251.056113455  0.354834E-02       0.743     7        0.00      0.74      0.00    0.5344E-02  0.4041E-03  0.7640E-02
-|  8   -251.056202612  0.891577E-04       0.731     8        0.00      0.73      0.00    0.3531E-02  0.1874E-03  0.2691E-02
-|  9   -251.056229052  0.264402E-04       0.724     9        0.00      0.72      0.00    0.7926E-03  0.6635E-04  0.9497E-03
-| 10   -251.056232215  0.316281E-05       0.713    10        0.00      0.71      0.00    0.2861E-03  0.2492E-04  0.2888E-03
-| 11   -251.056232756  0.540665E-06       0.704     1        0.00      0.70      0.00    0.2914E-04  0.3821E-05  0.3136E-04
-| 12   -251.056232764  0.757791E-08       0.685     2        0.00      0.68      0.00    0.8315E-05  0.4593E-06  0.9680E-05
+|  1   -250.525722400      ------         0.795     1        0.00      0.79      0.00    0.2182E+01  0.5671E-01  0.5611E+00
+|  2   -249.455629275  -.107009E+01       0.873     2        0.00      0.87      0.00    0.1743E+00  0.3802E-01  0.4617E+00
+|  3   -248.842125279  -.613504E+00       0.867     3        0.00      0.87      0.00    0.3258E+00  0.3433E-01  0.4458E+00
+|  4   -249.533628262  0.691503E+00       0.869     4        0.00      0.87      0.00    0.1839E+00  0.1264E-01  0.2004E+00
+|  5   -249.640610313  0.106982E+00       0.867     5        0.00      0.86      0.00    0.5006E-01  0.4335E-02  0.6857E-01
+|  6   -249.652518941  0.119086E-01       0.852     6        0.00      0.85      0.00    0.2671E-01  0.1614E-02  0.2404E-01
+|  7   -249.656074944  0.355600E-02       0.842     7        0.00      0.84      0.00    0.4969E-02  0.4113E-03  0.7028E-02
+|  8   -249.656173013  0.980687E-04       0.832     8        0.00      0.83      0.00    0.3058E-02  0.1789E-03  0.2684E-02
+|  9   -249.656195599  0.225858E-04       0.820     9        0.00      0.82      0.00    0.7903E-03  0.6754E-04  0.9622E-03
+| 10   -249.656198653  0.305409E-05       0.811    10        0.00      0.81      0.00    0.3021E-03  0.2516E-04  0.3423E-03
+| 11   -249.656199249  0.596348E-06       0.818     1        0.00      0.82      0.00    0.2581E-04  0.4012E-05  0.4220E-04
+| 12   -249.656199255  0.603848E-08       0.788     2        0.00      0.79      0.00    0.6933E-05  0.5209E-06  0.9728E-05
 | ------------------------------------------------------------------------------------------------------------------------
 | REACH CONVERGENCE AFTER  12 CYCLES
-| MAX ERROR = 0.831523E-05   RMS CHANGE = 0.459281E-06   MAX CHANGE = 0.967991E-05
+| MAX ERROR = 0.693289E-05   RMS CHANGE = 0.520945E-06   MAX CHANGE = 0.972828E-05
 | -----------------------------------------------
- ALPHA ELECTRON DENSITY    =    22.8426546022
- BETA ELECTRON DENSITY     =    22.8426546022
- ELECTRONIC ENERGY    =   -458.241411132
+ ALPHA ELECTRON DENSITY    =    22.0000289008
+ BETA ELECTRON DENSITY     =    22.0000289008
+ ELECTRONIC ENERGY    =   -456.841377623
  CORE_CORE REPULSION  =    207.185178368
- TOTAL ENERGY         =   -251.056232764
+ TOTAL ENERGY         =   -249.656199255
 
  @ End Energy calculation
 
@@ -236,25 +236,25 @@
 
     ATOMIC CHARGES
    ATOM          MULLIKEN            LOWDIN
-   C             -0.2247            -0.0922
-   C             -0.0226            -0.1105
-   C             -0.0716             0.0164
-   C             -0.1116            -0.1463
-   C              0.1969             0.0887
-   N             -0.5877            -0.1820
-   H              0.1687             0.1472
-   H              0.1747             0.1522
-   H              0.2062             0.1546
-   H              0.1464             0.1292
-   H              0.3797             0.2760
-   H              0.3755             0.2702
-   H              0.1882             0.1521
-   H              0.1818             0.1442
+   C             -0.2146            -0.0886
+   C             -0.0194            -0.1077
+   C             -0.0682             0.0184
+   C             -0.1051            -0.1437
+   C              0.1952             0.0891
+   N             -0.5738            -0.1710
+   H              0.1637             0.1444
+   H              0.1700             0.1494
+   H              0.2030             0.1522
+   H              0.1421             0.1266
+   H              0.3756             0.2729
+   H              0.3715             0.2671
+   H              0.1825             0.1492
+   H              0.1774             0.1417
    TOTAL         1.0000             1.0000
 
     DIPOLE (DEBYE)
       X         Y         Z        TOTAL
-    3.4620    0.9727    0.7202    3.6674
+    3.5281    0.9914    0.7267    3.7361
 
  @ End Charge and Dipole Calculation
 
@@ -262,19 +262,19 @@
  @ Output Timing Information
 
 ------------- TIMING ---------------
-| INITIAL GUESS TIME  =     0.079395000(  0.86%)
-| DFT GRID OPERATIONS =     0.302218000(  3.27%)
-| TOTAL SCF TIME      =     8.821417000( 95.53%)
-|       TOTAL OP TIME      =     8.812079000( 95.43%)
-|             TOTAL 1e TIME      =     0.003752000(  0.04%)
-|             TOTAL 2e TIME      =     2.285607000( 24.75%)
-|             TOTAL EXC TIME     =     6.518580000( 70.59%)
-|       TOTAL DII TIME      =     0.009192000(  0.10%)
-|             TOTAL DIAG TIME    =     0.006848000(  0.07%)
-| TOTAL TIME          =     9.234552000
+| INITIAL GUESS TIME  =     0.154378000(  1.46%)
+| DFT GRID OPERATIONS =     0.376700000(  3.56%)
+| TOTAL SCF TIME      =    10.037017000( 94.74%)
+|       TOTAL OP TIME      =    10.028006000( 94.66%)
+|             TOTAL 1e TIME      =     0.003496000(  0.03%)
+|             TOTAL 2e TIME      =     2.295919000( 21.67%)
+|             TOTAL EXC TIME     =     7.724716000( 72.92%)
+|       TOTAL DII TIME      =     0.008867000(  0.08%)
+|             TOTAL DIAG TIME    =     0.006890000(  0.07%)
+| TOTAL TIME          =    10.594138000
 ------------------------------------
-| Job cpu time:  0 days  0 hours  0 minutes  9.2 seconds.
+| Job cpu time:  0 days  0 hours  0 minutes 10.6 seconds.
 
  @ Finish Output Timing Information
 
-| Normal Termination. Task Finished on: Fri Apr 24 13:56:22 2026
+| Normal Termination. Task Finished on: Fri May  1 16:49:11 2026

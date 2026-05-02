@@ -73,10 +73,10 @@ ene_H2O_rhf_ccpvdz                  #H2O: RHF energy test: cc-pVDZ basis set
 ene_LiF_rhf_ccpvdz                  #LiF: RHF energy test: cc-pVDZ basis set
 ene_NH4_rhf_ccpvdz                  #NH4: RHF energy test: cc-pVDZ basis set
 ene_psb3_blyp_631g_sg2              
-ene_psb3_blyp_631g_sg3              
+ene_psb3_blyp_631g_sg3  
+ene_psb3_blyp_631g_eml            
 ene_wat_blyp_631g_sg2               
 ene_wat_blyp_631g_sg3
-ene_psb3_blyp_631g_eml
 ene_wat_blyp_631g_eml
 grad_AlH3_b3lyp_def2sv_p            #ALH3: DFT gradient test: DEF2-SV(P) basis set
 grad_BeH2_b3lyp_def2sv_p            #BeH2: DFT gradient test: DEF2-SV(P) basis set
