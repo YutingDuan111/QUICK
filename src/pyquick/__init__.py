@@ -96,12 +96,12 @@ class PyQuick:
         raise ValueError(f"method keyword {keyword!r} is not set")
 
     def set_output(self, stem):
-        """Set the file stem used only for optional auxiliary outputs.
+        """Set the file stem for QUICK's output (default ``'pyquick_job'``).
 
-        QUICK's diagnostic log is discarded (sent to the null device), so no
-        ``<stem>.out`` file is written.  This stem only names auxiliary files
-        that QUICK writes when their keyword is explicitly set (e.g. ``<stem>.dat``
-        with ``CHK_WRITE``, ``<stem>.molden`` with ``MOLDEN``).
+        QUICK writes its diagnostic log to ``<stem>.out`` unless the run is made
+        with ``log=False``.  The stem also names auxiliary files QUICK writes
+        when their keyword is set (e.g. ``<stem>.dat`` with ``CHK_WRITE``,
+        ``<stem>.molden`` with ``MOLDEN``).
         """
         _checked(_mod.job_set_output)(stem)
 
@@ -136,17 +136,25 @@ class PyQuick:
 
     # -- execution -----------------------------------------------------------
 
-    def run(self, jobtype=0):
+    def run(self, jobtype=0, log=True, max_cycles=0):
         """Run a QUICK job on the current setup.
 
         *jobtype* selects the work: ``0`` = single-point energy, ``1`` = energy
-        + nuclear gradient.  Must be called after :meth:`set_calc`,
-        :meth:`set_basis`, and :meth:`read_geom`.  Results are snapshotted and
-        available as properties afterwards.
+        + nuclear gradient, ``2`` = geometry optimization.  *max_cycles* applies
+        to ``jobtype=2`` only: ``<= 0`` runs to convergence with no cap (QUICK's
+        default), ``> 0`` caps the optimization cycles.  *log* writes QUICK's
+        diagnostic output to
+        ``<stem>.out`` (see :meth:`set_output`); ``log=False`` sends it to the
+        platform null device so the run leaves no file behind.
+
+        Must be called after :meth:`set_calc`, :meth:`set_basis`, and
+        :meth:`read_geom`.  Results are snapshotted and available as properties
+        afterwards.
 
         If this instance has been run before, the previous QUICK state is
         fully finalized before the new run begins, so basis sets and array
-        dimensions are always consistent.
+        dimensions are always consistent.  Successive runs append to the same
+        log file; the first run replaces it.
         """
         self._results = {}
         self._ran = False
@@ -166,7 +174,7 @@ class PyQuick:
             else:
                 _checked(_mod.set_method)(keyword)
         _checked(_mod.read_geom)(self._geom)
-        _checked(_mod.job_run)(jobtype)
+        _checked(_mod.job_run)(jobtype, 1 if log else 0, int(max_cycles))
         self._ran = True
         # snapshot all results into Python-owned storage so that a subsequent
         # run() on a different instance cannot overwrite this instance's results
@@ -207,6 +215,10 @@ class PyQuick:
         if _mod.job_has_gradient:
             g, n = _mod.job_get_gradients()
             self._results['gradient'] = g[:3 * n].reshape(n, 3).copy()
+        if _mod.job_has_optimized:
+            c, n = _mod.job_get_optimized_geometry()
+            self._results['optimized_coordinates'] = c[:3 * n].reshape(n, 3).copy()
+            self._results['converged'] = bool(_mod.job_opt_converged)
 
     def copy(self):
         """Return a new PyQuick with the same setup state.
@@ -399,18 +411,39 @@ class PyQuick:
 # transfer, per-run snapshotting); Calculation/Result are the documented surface.
 # ---------------------------------------------------------------------------
 
+# Log/output file stem used when a run is given no name. Mirrors the default of
+# `output_stem` in pyquick.f90.
+_DEFAULT_LOG_STEM = 'pyquick_job'
+
+
+def _count_atoms(geometry):
+    """Number of atom lines ('SYMBOL X Y Z') in a geometry string.
+
+    A light count for the geo_opt atom-count guard, not a full parse — QUICK
+    still validates the geometry itself in read_geom.
+    """
+    return sum(1 for line in str(geometry).splitlines() if len(line.split()) >= 4)
+
 # The energy breakdown is ALWAYS returned (every job computes it), so it is not
 # a "property" the caller opts into.
 _ENERGY_ATTRS = ('total_energy', 'nuclear_repulsion', 'e_electronic',
                  'e_one_electron', 'e_two_electron', 'e_xc')
 
-# Opt-in extras the caller selects via `properties`.
+# Opt-in extras the caller selects via `properties`.  These cost extra work
+# beyond the SCF (they need the DIPOLE keyword), so they are not returned unless
+# asked for.
 _SUPPORTED_PROPERTIES = {
     'mulliken_charges',  # needs the DIPOLE keyword to be computed
     'lowdin_charges',    # needs the DIPOLE keyword to be computed
+    'dipole',            # dipole moment vector (Debye)
+}
+
+# Always returned on the Result because every SCF computes them for free
+# (no extra keyword, no extra routine).  Accepted in `properties` for backward
+# compatibility, but they are a no-op there — you get them either way.
+_ALWAYS_ON_PROPERTIES = {
     'mo_energies',       # alpha MO energies
     'density_matrix',    # alpha density matrix
-    'dipole',            # dipole moment vector (Debye)
 }
 
 # These are all computed inside QUICK's `dipole` routine, which only runs when
@@ -437,8 +470,6 @@ _DEFERRED_PROPERTIES = {
 _PROPERTY_ATTRS = {
     'mulliken_charges': ('mulliken',),
     'lowdin_charges': ('lowdin',),
-    'mo_energies': ('mo_energies',),
-    'density_matrix': ('density_matrix',),
     'dipole': ('dipole',),
 }
 
@@ -497,9 +528,12 @@ class Calculation:
     basis : str
         Basis set name, e.g. ``'6-31G*'``.
     properties : iterable of str
-        Optional extras to make available on the Result — ``'mulliken_charges'``,
-        ``'lowdin_charges'``, ``'mo_energies'``, ``'density_matrix'``.  The energy
-        breakdown is always returned and is not listed here.
+        Opt-in extras to make available on the Result: ``'mulliken_charges'``,
+        ``'lowdin_charges'``, ``'dipole'`` (all need the DIPOLE keyword).  The
+        energy breakdown, geometry, ``mo_energies`` and ``density_matrix`` are
+        **always** returned (every SCF computes them for free), so they are not
+        listed here; naming ``mo_energies``/``density_matrix`` is accepted but
+        has no effect.
     charge : int
         Total molecular charge (``CHARGE=``). Default 0.
     mult : int
@@ -507,10 +541,17 @@ class Calculation:
     keywords : dict
         Extra QUICK keyword tokens. ``{'cutoff': '1e-9'}`` -> ``CUTOFF=1e-9``;
         a value of ``None`` emits a bare flag.
+    log : bool
+        Write QUICK's diagnostic log (default ``True``).  The file is named after
+        the run's *name* -- ``get_energy(geom, name='water')`` -> ``water.out`` --
+        or ``pyquick_job.out`` when no name is given.  Successive runs of the same
+        Calculation append; an existing file is backed up to ``<file>~``.
+        ``log=False`` sends the log to the platform null device, so the run leaves
+        nothing on disk.
     """
 
     def __init__(self, method, basis, properties=(),
-                 charge=0, mult=1, keywords=None):
+                 charge=0, mult=1, keywords=None, log=True):
         if not basis or not str(basis).strip():
             raise ValueError("Calculation requires a 'basis' (e.g. '6-31G*')")
 
@@ -518,6 +559,8 @@ class Calculation:
         for p in requested:
             if p in _SUPPORTED_PROPERTIES:
                 continue
+            if p in _ALWAYS_ON_PROPERTIES:
+                continue                       # always returned; naming it is a no-op
             if p in _JOBTYPE_WORDS:
                 raise ValueError(
                     f"{p!r} is not a property — the job type is chosen by the "
@@ -537,6 +580,7 @@ class Calculation:
         self.charge = int(charge)
         self.mult = int(mult)
         self.keywords = dict(keywords) if keywords else {}
+        self.log = bool(log)
         self._calc_keyword, self._functional = _resolve_method(method, self.mult)
         self._engine = None
 
@@ -559,20 +603,29 @@ class Calculation:
                 job.set_method(key, str(value))
         return job
 
-    def get_energy(self, geometry, name=None):
-        """Single-point energy on *geometry*; returns a :class:`Result`.
-
-        *geometry* is a 'SYMBOL X Y Z' multi-line string (Angstrom).  *name* is a
-        label carried through to ``Result.metadata['name']`` — it does **not**
-        create any file (QUICK's diagnostic log is discarded; the API writes no
-        files).  A single engine is reused across successive calls on the same
-        Calculation, so each call fully finalizes the previous one inside QUICK.
-        """
+    def _prepare(self, geometry, name):
+        """Shared setup for a run: engine, output stem, geometry."""
         if self._engine is None:
             self._engine = self._build_engine()
         job = self._engine
+        # Set the stem on every run, not just when a name is given: it is Fortran
+        # module state that would otherwise persist from an earlier run (or from
+        # another Calculation), silently sending this run's log to that file.
+        job.set_output(str(name) if name is not None else _DEFAULT_LOG_STEM)
         job.read_geom(geometry)
-        job.run()
+        return job
+
+    def get_energy(self, geometry, name=None):
+        """Single-point energy on *geometry*; returns a :class:`Result`.
+
+        *geometry* is a 'SYMBOL X Y Z' multi-line string (Angstrom).  *name*
+        labels the run (it lands in ``Result.metadata['name']``) and, when
+        logging is on, names the log file — ``name='water'`` -> ``water.out``.
+        A single engine is reused across successive calls on the same
+        Calculation, so each call fully finalizes the previous one inside QUICK.
+        """
+        job = self._prepare(geometry, name)
+        job.run(jobtype=0, log=self.log)
         return Result._from_engine(job, self, geometry, name)
 
     def get_grad(self, geometry, name=None):
@@ -581,21 +634,44 @@ class Calculation:
         The gradient job runs the SCF and the gradient together, so the returned
         Result carries **both** the energy breakdown and ``gradient`` (dE/dR,
         shape ``(natom, 3)``, Hartree/Bohr) — the energy is not computed twice.
+        *name* labels the run and, when logging is on, names the log file.
         """
-        if self._engine is None:
-            self._engine = self._build_engine()
-        job = self._engine
-        job.read_geom(geometry)
-        job.run(jobtype=1)
+        job = self._prepare(geometry, name)
+        job.run(jobtype=1, log=self.log)
         return Result._from_engine(job, self, geometry, name)
 
-    def geo_opt(self, geometry, name=None):
-        """Optimize *geometry* and return the optimized structure + energy.
+    def geo_opt(self, geometry, name=None, max_cycles=None):
+        """Optimize *geometry*; returns a :class:`Result`.
 
-        Not implemented yet — the QUICK optimizer path is Phase 2.
+        Starting from *geometry*, QUICK relaxes the structure and the Result
+        carries ``optimized_coordinates`` (final structure, Angstrom),
+        ``converged`` (did it reach the convergence criteria, or just run out of
+        cycles?), and the energy breakdown **of the optimized structure**.
+        ``coordinates`` still holds the geometry you passed in.
+
+        *max_cycles* caps the optimization; the default (``None``) runs to
+        convergence with no cap, which is QUICK's own behaviour.
+
+        The optimizer is QUICK's default (DL-Find) unless you add the Cartesian
+        optimizer via ``keywords={'LOPT': None}``.  DL-Find does not support
+        molecules with fewer than 3 atoms — for those, use ``LOPT`` (this raises
+        a ``ValueError`` otherwise).
+
+        Always check ``result.converged`` — a run that hits *max_cycles* returns
+        the last step's geometry, which is **not** optimized.
         """
-        raise NotImplementedError(
-            "geo_opt() is not implemented yet (Phase 2: geometry optimization)")
+        # DL-Find (the default) fails on < 3 atoms; steer the user to LOPT.
+        using_lopt = any(str(k).upper() == 'LOPT' for k in self.keywords)
+        if not using_lopt and _count_atoms(geometry) < 3:
+            raise ValueError(
+                "DL-Find (the default geometry optimizer) does not support "
+                "molecules with fewer than 3 atoms. Use the Cartesian optimizer: "
+                "Calculation(..., keywords={'LOPT': None}).")
+
+        job = self._prepare(geometry, name)
+        job.run(jobtype=2, log=self.log,
+                max_cycles=0 if max_cycles is None else int(max_cycles))
+        return Result._from_engine(job, self, geometry, name)
 
     @property
     def input_string(self):
@@ -631,7 +707,7 @@ class Result:
         values['atomic_numbers'] = job._results['atomic_numbers']
         values['coordinates'] = job._results['coordinates']
         for key in ('mulliken', 'lowdin', 'mo_energies', 'density_matrix',
-                    'dipole', 'gradient'):
+                    'dipole', 'gradient', 'optimized_coordinates', 'converged'):
             if key in job._results:
                 values[key] = job._results[key]
         metadata = {
@@ -723,7 +799,22 @@ class Result:
                 "Calculation(..., keywords={'EXTCHARGES': None})")
         return self._values['e_external_charge']
 
-    # -- opt-in arrays -------------------------------------------------------
+    # -- always available (every SCF computes them) --------------------------
+    @property
+    def mo_energies(self):
+        """Alpha molecular orbital energies, numpy array of shape (NBSuse,)."""
+        if 'mo_energies' not in self._values:
+            raise AttributeError("'mo_energies' was not computed for this run")
+        return self._values['mo_energies']
+
+    @property
+    def density_matrix(self):
+        """Alpha density matrix, numpy array of shape (nbasis, nbasis)."""
+        if 'density_matrix' not in self._values:
+            raise AttributeError("'density_matrix' was not computed for this run")
+        return self._values['density_matrix']
+
+    # -- opt-in arrays (need the DIPOLE keyword) -----------------------------
     @property
     def mulliken(self):
         """Mulliken partial charges, numpy array of shape (natom,)."""
@@ -733,16 +824,6 @@ class Result:
     def lowdin(self):
         """Lowdin partial charges, numpy array of shape (natom,)."""
         return self._get('lowdin_charges', 'lowdin')
-
-    @property
-    def mo_energies(self):
-        """Alpha molecular orbital energies, numpy array of shape (NBSuse,)."""
-        return self._get('mo_energies', 'mo_energies')
-
-    @property
-    def density_matrix(self):
-        """Alpha density matrix, numpy array of shape (nbasis, nbasis)."""
-        return self._get('density_matrix', 'density_matrix')
 
     @property
     def dipole(self):
@@ -761,6 +842,34 @@ class Result:
                 "'gradient' is unavailable: this Result came from get_energy() — "
                 "use calc.get_grad(geometry) to compute the nuclear gradient")
         return self._values['gradient']
+
+    # -- optimization (produced by geo_opt) ----------------------------------
+    @property
+    def optimized_coordinates(self):
+        """Optimized atomic coordinates in Angstrom, shape (natom, 3).
+
+        Only present on a Result from :meth:`Calculation.geo_opt`.  Check
+        :attr:`converged` before trusting it — a run that hit the cycle limit
+        returns the last step's geometry, not an optimized one.
+        """
+        if 'optimized_coordinates' not in self._values:
+            raise AttributeError(
+                "'optimized_coordinates' is unavailable: this Result did not come "
+                "from an optimization — use calc.geo_opt(geometry)")
+        return self._values['optimized_coordinates']
+
+    @property
+    def converged(self):
+        """True if the geometry optimization reached its convergence criteria.
+
+        False means it stopped at the cycle limit, so ``optimized_coordinates``
+        is the last step's geometry and is **not** optimized.
+        """
+        if 'converged' not in self._values:
+            raise AttributeError(
+                "'converged' is unavailable: it only applies to an optimization — "
+                "use calc.geo_opt(geometry)")
+        return self._values['converged']
 
     # -- geometry (always available, as parsed by QUICK) ---------------------
     @property

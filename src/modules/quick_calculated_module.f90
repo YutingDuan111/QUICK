@@ -166,6 +166,10 @@ module quick_calculated_module
       ! dipole moment vector (x,y,z) in Debye, set by subroutine dipole
       double precision :: dipole(3) = 0.0d0
 
+      ! whether a geometry optimization reached its convergence criteria
+      ! (set by lopt and by DL-Find; false if it stopped at the cycle limit)
+      logical :: opt_converged = .false.
+
       ! MP2 perturbation energy
       double precision :: EMP2
 

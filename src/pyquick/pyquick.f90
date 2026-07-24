@@ -15,6 +15,8 @@ module pyquick
     use quick_sad_guess_module, only : getSadGuess
     use quick_grad_cshell_module, only : cshell_gradient
     use quick_grad_oshell_module, only : oshell_gradient
+    use quick_optimizer_module, only : lopt
+    use quick_exception_module, only : get_exception_message
 
     implicit none
 
@@ -29,7 +31,8 @@ module pyquick
               job_has_dispersion, job_has_extcharge, job_has_gradient, &
               job_has_mulliken, job_has_lowdin, job_has_mo_energies, job_has_density_matrix, &
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
-              job_get_gradients, job_get_geometry
+              job_get_gradients, job_get_geometry, job_exception_message, &
+              job_has_optimized, job_opt_converged, job_get_optimized_geometry
 
     integer, parameter :: KEYWORD_LEN = 300
     integer, parameter :: INPUT_LEN   = 10000
@@ -77,6 +80,11 @@ module pyquick
 
     ! whether a nuclear gradient was computed for the last run
     logical :: job_has_gradient = .false.
+
+    ! geometry optimization: whether the last run was an OPT job, and whether it
+    ! reached convergence (as opposed to stopping at the cycle limit)
+    logical :: job_has_optimized  = .false.
+    logical :: job_opt_converged  = .false.
 
     ! availability flags for array results
     logical :: job_has_mulliken      = .false.
@@ -321,17 +329,27 @@ contains
         output_stem = trim(stem)
     end subroutine job_set_output
 
-    subroutine job_run(jobtype)
-        ! jobtype: 0 = single-point energy, 1 = energy + nuclear gradient.
-        ! (2 = geometry optimization is reserved for a later phase.)
+    subroutine job_run(jobtype, do_log, max_cycles)
+        ! jobtype: 0 = single-point energy
+        !          1 = energy + nuclear gradient
+        !          2 = geometry optimization
+        ! do_log:  1 = write QUICK's log to <output_stem>.out (default behaviour),
+        !          0 = send it to the platform null device, leaving no file.
+        ! max_cycles: for jobtype 2 only -- <= 0 emits a bare OPTIMIZE keyword
+        !          (QUICK's default: run to convergence, no cap); > 0 emits
+        !          OPTIMIZE=<n> to cap the number of optimization cycles.
         integer, intent(in) :: jobtype
+        integer, intent(in) :: do_log
+        integer, intent(in) :: max_cycles
         ! External free subroutines in libquick.so
         external :: initialize1, read_Job_and_Atom, getMol, getEnergy, dipole
-        external :: finalize, outputCopyright, PrtDate
+        external :: finalize, outputCopyright, PrtDate, quick_open, dl_find
 
         character(len=:), allocatable :: keyword_line
         character(len=:), allocatable :: null_dev
         character(len=10) :: kwlen_str
+        character(len=12) :: cyc_str
+        character(len=1) :: open_mode
         integer :: ierr, i, j, k, ios
         integer :: natm_type
         integer :: atm_type_id(geom_natom)
@@ -339,6 +357,14 @@ contains
         character(len=256) :: note
 
         ierr = 0
+
+        ! --- decide the log open mode before finalize clears job_active ---
+        ! first run replaces the file; re-runs append to it
+        if (job_active) then
+            open_mode = 'A'
+        else
+            open_mode = 'R'
+        end if
 
         ! --- if a previous run is still active, finalize it before re-running ---
         ! This deallocates all basis/MO/density arrays sized for the previous run
@@ -373,6 +399,19 @@ contains
         ! quick_method%grad before getMol allocates quick_qm_struct%gradient
         if (jobtype == 1) keyword_line = trim(keyword_line) // ' GRADIENT'
 
+        ! for an optimization, OPTIMIZE sets quick_method%opt (and %grad). A bare
+        ! keyword leaves iopt=0, which QUICK treats as "no cap, run to
+        ! convergence"; OPTIMIZE=<n> caps the cycles. The optimizer is QUICK's
+        ! default (DL-Find) unless the user added the LOPT keyword (Cartesian).
+        if (jobtype == 2) then
+            if (max_cycles > 0) then
+                write(cyc_str, '(I0)') max_cycles
+                keyword_line = trim(keyword_line) // ' OPTIMIZE=' // trim(cyc_str)
+            else
+                keyword_line = trim(keyword_line) // ' OPTIMIZE'
+            end if
+        end if
+
         ! --- guard against silent Fortran truncation on assignment to quick_api%Keywd ---
         if (len_trim(keyword_line) > KEYWORD_LEN) then
             write(kwlen_str, '(I0)') KEYWORD_LEN
@@ -403,21 +442,30 @@ contains
             return
         end if
 
-        ! --- send QUICK's diagnostic log to the null device (no on-disk file) ---
-        ! Override the <stem>.out name that set_quick_files derived, and open the
-        ! unit directly (not via quick_open, which would try to back up an existing
-        ! file with 'mv' -- meaningless and failing for a null device). The device
-        ! name is chosen at runtime so this works on Windows (NUL) as well as
-        ! Unix/macOS (/dev/null).
-        null_dev = null_device()
-        outFileName = null_dev
-        inquire(unit=iOutFile, opened=unit_open)
-        if (unit_open) close(iOutFile)
-        open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
-             action='WRITE', iostat=ios)
-        if (ios /= 0) then
-            call fail('job_run: could not open null output device')
-            return
+        ! --- open QUICK's diagnostic log ---
+        if (do_log /= 0) then
+            ! Normal case: a real <output_stem>.out file, as set_quick_files
+            ! derived it. quick_open backs up any pre-existing file to '<file>~'.
+            call quick_open(iOutFile, outFileName, 'U', 'F', open_mode, .false., ierr)
+            if (ierr /= 0) then
+                call fail('job_run: quick_open failed')
+                return
+            end if
+        else
+            ! Opted out: send the log to the platform null device so the run
+            ! leaves nothing on disk. Open the unit directly rather than through
+            ! quick_open, which would try to back up the device with 'mv'. The
+            ! device name is chosen at runtime so this also works on Windows (NUL).
+            null_dev = null_device()
+            outFileName = null_dev
+            inquire(unit=iOutFile, opened=unit_open)
+            if (unit_open) close(iOutFile)
+            open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
+                 action='WRITE', iostat=ios)
+            if (ios /= 0) then
+                call fail('job_run: could not open null output device')
+                return
+            end if
         end if
 
         call outputCopyright(iOutFile, ierr)
@@ -508,11 +556,31 @@ contains
         call getEriPrecomputables()
         call schwarzoff()
 
-        ! --- energy, or energy + gradient (a gradient job runs the SCF itself) ---
-        ! quick_method%grad is set from the GRADIENT keyword appended above; when
-        ! set we call the gradient routine instead of getEnergy (matching
-        ! quick_api_module) so the SCF is not run twice.
-        if (quick_method%grad) then
+        ! --- energy, gradient, or optimization ---
+        ! quick_method%opt/%grad come from the OPTIMIZE/GRADIENT keywords appended
+        ! above. Each branch runs its own SCF, so getEnergy is only called for a
+        ! plain energy job (this mirrors quick_api_module / main.f90).
+        if (quick_method%opt) then
+            ! DL-Find is QUICK's default optimizer; the LOPT keyword selects the
+            ! Cartesian optimizer instead. DL-Find crashes on molecules with fewer
+            ! than 3 atoms, so refuse that combination with a clear message rather
+            ! than segfaulting (the Python layer guards this too).
+            if (quick_method%usedlfind) then
+                if (geom_natom < 3) then
+                    call fail('geo_opt: DL-Find does not support molecules with ' // &
+                              'fewer than 3 atoms; use the Cartesian optimizer ' // &
+                              '(add the LOPT keyword)')
+                    return
+                end if
+                call dl_find(ierr, .true.)
+            else
+                call lopt(ierr)
+            end if
+            if (ierr /= 0) then
+                call fail('job_run: geometry optimization failed')
+                return
+            end if
+        else if (quick_method%grad) then
             if (quick_method%unrst) then
                 call oshell_gradient(ierr)
             else
@@ -555,6 +623,10 @@ contains
         job_has_density_matrix = allocated(quick_qm_struct%dense)
         job_has_gradient       = quick_method%grad .and. &
                                  allocated(quick_qm_struct%gradient)
+
+        ! --- optimization: whether this was an OPT job and whether it converged ---
+        job_has_optimized = quick_method%opt
+        job_opt_converged = quick_qm_struct%opt_converged
 
         job_active = .true.
 
@@ -666,6 +738,29 @@ contains
         end do
     end subroutine job_get_gradients
 
+    subroutine job_get_optimized_geometry(coords, n)
+        ! Returns the geometry after a successful OPT job: QUICK optimizes
+        ! quick_molspec%xyz in place, in Bohr, so convert back to Angstrom here
+        ! to match the units read_geom accepts and job_get_geometry returns.
+        ! Flat, row-major per atom: (x1,y1,z1, x2,y2,z2, ...); reshape (n, 3).
+        !f2py intent(out) coords, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: coords(30000)
+        integer :: i, j
+        coords = 0.0d0
+        if (.not. job_has_optimized) then
+            call fail("'optimized_coordinates' were not computed; use geo_opt()")
+            n = 0
+            return
+        end if
+        n = natom
+        do i = 1, natom
+            do j = 1, 3
+                coords((i - 1) * 3 + j) = xyz(j, i) / A_TO_BOHRS
+            end do
+        end do
+    end subroutine job_get_optimized_geometry
+
     subroutine job_get_geometry(atnums, coords, n)
         ! Returns QUICK's own parsed geometry: atomic numbers and Angstrom
         ! coordinates as stored by read_geom (no re-parsing on the Python side).
@@ -751,6 +846,14 @@ contains
         had_error     = .true.
         error_message = trim(message)
     end subroutine fail
+
+    subroutine job_exception_message(code, msg)
+        ! Expose QUICK's error text for a code, so Python can report/inspect it.
+        !f2py intent(out) msg
+        integer, intent(in) :: code
+        character(len=200), intent(out) :: msg
+        call get_exception_message(code, msg)
+    end subroutine job_exception_message
 
     function uppercase(text) result(upper)
         character(len=*), intent(in) :: text
