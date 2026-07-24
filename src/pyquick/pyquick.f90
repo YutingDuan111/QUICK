@@ -344,6 +344,12 @@ contains
         ! max_cycles: for jobtype 2 only -- <= 0 emits a bare OPTIMIZE keyword
         !          (QUICK's default: run to convergence, no cap); > 0 emits
         !          OPTIMIZE=<n> to cap the number of optimization cycles.
+#if defined(GPU)
+        ! GPU builds only: allmod exposes the gpu_* device routines and the basis
+        ! arrays the uploads need. Compiled out on the CPU build (needs the build
+        ! to preprocess this file: -cpp, and -DGPU for GPU builds).
+        use allmod
+#endif
         integer, intent(in) :: jobtype
         integer, intent(in) :: do_log
         integer, intent(in) :: max_cycles
@@ -493,6 +499,13 @@ contains
             return
         end if
 
+#if defined(GPU)
+        ! --- GPU: create context and pick a device (mirrors main.f90) ---
+        call gpu_new(ierr)
+        call gpu_init_device(ierr)
+        call gpu_write_info(iOutFile, ierr)
+#endif
+
         ! reads keyword from quick_api%Keywd; skips coordinate read (apiMode)
         call read_Job_and_Atom(ierr)
         if (ierr /= 0) then
@@ -558,9 +571,39 @@ contains
             return
         end if
 
+#if defined(GPU)
+        ! --- GPU: allocate scratch, upload method + molecule/coords ---
+        call gpu_allocate_scratch(quick_method%grad .or. quick_method%opt)
+        call upload(quick_method, ierr)
+        if (.not. quick_method%opt) then
+            call gpu_setup(natom, nbasis, quick_molspec%nElec, quick_molspec%imult, &
+                           quick_molspec%molchg, quick_molspec%iAtomType)
+            call gpu_upload_xyz(xyz)
+            call gpu_upload_atom_and_chg(quick_molspec%iattype, quick_molspec%chg)
+        end if
+#endif
+
         ! --- ERI precomputables and cutoff screening ---
         call getEriPrecomputables()
         call schwarzoff()
+
+#if defined(GPU)
+        ! --- GPU: upload basis + Schwarz cutoffs (needs the arrays just built) ---
+        if (.not. quick_method%opt) then
+            call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
+                ncontract, itype, aexp, dcoeff, &
+                quick_basis%first_basis_function, quick_basis%last_basis_function, &
+                quick_basis%first_shell_basis_function, quick_basis%last_shell_basis_function, &
+                quick_basis%ncenter, quick_basis%kstart, quick_basis%katom, &
+                quick_basis%ktype, quick_basis%kprim, quick_basis%kshell, quick_basis%Ksumtype, &
+                quick_basis%Qnumber, quick_basis%Qstart, quick_basis%Qfinal, &
+                quick_basis%Qsbasis, quick_basis%Qfbasis, &
+                quick_basis%gccoeff, quick_basis%cons, quick_basis%gcexpo, quick_basis%KLMN)
+            call gpu_upload_cutoff_matrix(Ycutoff, cutPrim)
+            call gpu_upload_oei(quick_molspec%nExtAtom, quick_molspec%extxyz, &
+                                quick_molspec%extchg, ierr)
+        end if
+#endif
 
         ! --- energy, gradient, or optimization ---
         ! quick_method%opt/%grad come from the OPTIMIZE/GRADIENT keywords appended
@@ -606,6 +649,12 @@ contains
 
         ! --- post-SCF charges/dipole + harvest all results ---
         call harvest_results(quick_method%grad)
+
+#if defined(GPU)
+        ! --- GPU: free device scratch and context ---
+        call gpu_deallocate_scratch(quick_method%grad .or. quick_method%opt)
+        call gpu_delete(ierr)
+#endif
 
         job_active = .true.
 
