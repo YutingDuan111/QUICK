@@ -24,6 +24,7 @@ module pyquick
     public :: set_calc, set_basis, set_method, clear_methods, read_geom, &
               had_error, error_message, print_input, input_string, &
               job_run, job_destroy, job_set_output, &
+              job_open, job_step, job_close, &
               job_active, &
               job_total_energy, job_e_core, job_e_electronic, &
               job_e_1e, job_e_xc, job_e_disp, job_e_charge, &
@@ -59,6 +60,11 @@ module pyquick
 
     ! job state
     logical :: job_active = .false.
+
+    ! a persistent job (job_open .. repeated job_step .. job_close) is set up:
+    ! the molecule and basis are allocated once and the density is reused across
+    ! steps (only coordinates change), until job_close frees everything.
+    logical :: job_open_flag = .false.
 
     ! scalar results (always available after a successful job_run)
     ! job_e_core is QUICK's ECore: the core-core NUCLEAR REPULSION energy
@@ -598,10 +604,179 @@ contains
             end if
         end if
 
-        ! --- post-SCF: Mulliken/Lowdin charges and dipole moment ---
+        ! --- post-SCF charges/dipole + harvest all results ---
+        call harvest_results(quick_method%grad)
+
+        job_active = .true.
+
+    end subroutine job_run
+
+    ! -----------------------------------------------------------------------
+    ! Persistent job: set up once (job_open), run many geometries of the same
+    ! molecule (job_step, reusing the density), then free everything (job_close).
+    ! -----------------------------------------------------------------------
+
+    subroutine job_open(do_log)
+        ! One-time setup for a fixed molecule. Prerequisites (as for job_run):
+        ! set_calc, set_basis and read_geom (the initial geometry) must be done.
+        ! do_log: 1 = write <stem>.out, 0 = null device.
+        integer, intent(in) :: do_log
+        external :: initialize1, read_Job_and_Atom, getMol
+        external :: outputCopyright, PrtDate, quick_open
+
+        character(len=:), allocatable :: keyword_line, null_dev
+        character(len=10) :: kwlen_str
+        integer :: ierr, i, j, k, ios, natm_type
+        integer :: atm_type_id(geom_natom)
+        logical :: new_type, unit_open
+        character(len=256) :: note
+
+        ierr = 0
+        if (job_open_flag) then
+            call fail('job_open: a job is already open; call job_close first')
+            return
+        end if
+        if (.not. has_calc)  then; call fail('job_open: call set_calc before'); return; end if
+        if (.not. has_basis) then; call fail('job_open: call set_basis before'); return; end if
+        if (.not. has_geom)  then; call fail('job_open: call read_geom before'); return; end if
+
+        ! Append GRADIENT so getMol sizes quick_qm_struct%gradient; individual
+        ! steps then opt into a gradient without re-running getMol.
+        keyword_line = trim(build_keyword_line()) // ' GRADIENT'
+        if (len_trim(keyword_line) > KEYWORD_LEN) then
+            write(kwlen_str, '(I0)') KEYWORD_LEN
+            call fail('job_open: keyword line exceeds ' // trim(kwlen_str) // ' characters')
+            return
+        end if
+
+        quick_api%apiMode  = .true.
+        quick_api%hasKeywd = .true.
+        quick_api%Keywd    = trim(keyword_line)
+        inFileName = trim(output_stem) // '.in'
+        isTemplate = .true.
+
+        call initialize1(ierr)
+        if (ierr /= 0) then; call fail('job_open: initialize1 failed'); return; end if
+        call set_quick_files(.true., ierr)
+        if (ierr /= 0) then; call fail('job_open: set_quick_files failed'); return; end if
+
+        if (do_log /= 0) then
+            call quick_open(iOutFile, outFileName, 'U', 'F', 'R', .false., ierr)
+            if (ierr /= 0) then; call fail('job_open: quick_open failed'); return; end if
+        else
+            null_dev = null_device()
+            outFileName = null_dev
+            inquire(unit=iOutFile, opened=unit_open)
+            if (unit_open) close(iOutFile)
+            open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
+                 action='WRITE', iostat=ios)
+            if (ios /= 0) then; call fail('job_open: could not open null output device'); return; end if
+        end if
+
+        call outputCopyright(iOutFile, ierr)
+        note = 'TASK STARTS ON:'
+        call PrtDate(iOutFile, note, ierr)
+        call print_quick_io_file(iOutFile, ierr)
+
+        call read_Job_and_Atom(ierr)
+        if (ierr /= 0) then; call fail('job_open: read_Job_and_Atom failed'); return; end if
+
+        natom = geom_natom
+        call alloc(quick_molspec, .false., ierr)
+        if (ierr /= 0) then; call fail('job_open: alloc(quick_molspec) failed'); return; end if
+
+        ! atom types (deduplicate by atomic number) + initial coordinates
+        natm_type = 0
+        atm_type_id = 0
+        do i = 1, geom_natom
+            new_type = .true.
+            do k = 1, natm_type
+                if (atm_type_id(k) == geom_atnum(i)) then; new_type = .false.; exit; end if
+            end do
+            if (new_type) then; natm_type = natm_type + 1; atm_type_id(natm_type) = geom_atnum(i); end if
+        end do
+        quick_molspec%iAtomType = natm_type
+        do i = 1, natm_type
+            quick_molspec%atom_type_sym(i) = SYMBOL(atm_type_id(i))
+        end do
+        do i = 1, geom_natom
+            quick_molspec%iattype(i) = geom_atnum(i)
+            do j = 1, 3
+                xyz(j, i) = geom_coords(j, i) * A_TO_BOHRS
+            end do
+        end do
+        quick_molspec%xyz => xyz
+
+        if (quick_method%SAD) then
+            call getSadGuess(ierr)
+            if (ierr /= 0) then; call fail('job_open: getSadGuess failed'); return; end if
+        end if
+        call getMol(ierr)
+        if (ierr /= 0) then; call fail('job_open: getMol failed'); return; end if
+
+        job_open_flag = .true.
+        job_active    = .true.
+    end subroutine job_open
+
+    subroutine job_step(want_gradient)
+        ! Run one geometry of the open job. read_geom must have set the new
+        ! coordinates (same atoms). want_gradient: 1 = also compute the gradient.
+        ! getMol is NOT called, so quick_qm_struct%dense from the previous step
+        ! survives and seeds this SCF.
+        integer, intent(in) :: want_gradient
+        integer :: ierr, i, j
+
+        ierr = 0
+        if (.not. job_open_flag) then
+            call fail('job_step: no job is open; call job_open first')
+            return
+        end if
+        if (geom_natom /= natom) then
+            call fail('job_step: geometry has a different number of atoms than the open job')
+            return
+        end if
+
+        ! update coordinates only (atoms are fixed for the job)
+        do i = 1, natom
+            do j = 1, 3
+                xyz(j, i) = geom_coords(j, i) * A_TO_BOHRS
+            end do
+        end do
+
+        call getEriPrecomputables()
+        call schwarzoff()
+
+        if (want_gradient /= 0) then
+            if (quick_method%unrst) then
+                call oshell_gradient(ierr)
+            else
+                call cshell_gradient(ierr)
+            end if
+            if (ierr /= 0) then; call fail('job_step: gradient calculation failed'); return; end if
+        else
+            call getEnergy(.false., ierr)
+            if (ierr /= 0) then; call fail('job_step: getEnergy failed'); return; end if
+        end if
+
+        call harvest_results(want_gradient /= 0)
+    end subroutine job_step
+
+    subroutine job_close()
+        external :: finalize
+        integer :: ierr
+        ierr = 0
+        if (job_active) call finalize(iOutFile, ierr, 1)
+        job_active    = .false.
+        job_open_flag = .false.
+    end subroutine job_close
+
+    subroutine harvest_results(did_gradient)
+        ! Copy energies/properties out of QUICK's module state after a run.
+        external :: dipole
+        logical, intent(in) :: did_gradient
+
         if (quick_method%dipole) call dipole
 
-        ! --- harvest scalar results ---
         job_total_energy   = quick_qm_struct%ETot
         job_e_core         = quick_qm_struct%ECore
         job_e_electronic   = quick_qm_struct%EEl
@@ -612,25 +787,18 @@ contains
         job_has_dispersion = quick_method%edisp
         job_has_extcharge  = quick_method%extcharges
 
-        ! --- dipole vector (Debye), available only when the dipole routine ran ---
         job_has_dipole = quick_method%dipole
         if (quick_method%dipole) job_dipole = quick_qm_struct%dipole
 
-        ! --- set array availability flags ---
         job_has_mulliken       = quick_method%dipole
         job_has_lowdin         = quick_method%dipole
         job_has_mo_energies    = allocated(quick_qm_struct%E)
         job_has_density_matrix = allocated(quick_qm_struct%dense)
-        job_has_gradient       = quick_method%grad .and. &
-                                 allocated(quick_qm_struct%gradient)
+        job_has_gradient       = did_gradient .and. allocated(quick_qm_struct%gradient)
 
-        ! --- optimization: whether this was an OPT job and whether it converged ---
         job_has_optimized = quick_method%opt
         job_opt_converged = quick_qm_struct%opt_converged
-
-        job_active = .true.
-
-    end subroutine job_run
+    end subroutine harvest_results
 
     subroutine job_destroy()
         external :: finalize

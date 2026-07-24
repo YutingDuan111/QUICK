@@ -176,6 +176,45 @@ class PyQuick:
         _checked(_mod.read_geom)(self._geom)
         _checked(_mod.job_run)(jobtype, 1 if log else 0, int(max_cycles))
         self._ran = True
+        self._snapshot()
+
+    def _replay_setup(self):
+        """Replay this instance's calc/basis/methods into the Fortran singleton."""
+        _mod.clear_methods()
+        _checked(_mod.set_calc)(self._calc)
+        _checked(_mod.set_basis)(self._basis)
+        for keyword, arg in self._methods:
+            if arg is not None:
+                _checked(_mod.set_method)(keyword, arg)
+            else:
+                _checked(_mod.set_method)(keyword)
+
+    def job_open(self, log=True):
+        """Set up a persistent job (allocate once) on the current setup."""
+        if self._calc is None:
+            raise RuntimeError("call set_calc() before job_open()")
+        if self._basis is None:
+            raise RuntimeError("call set_basis() before job_open()")
+        if self._geom is None:
+            raise RuntimeError("call read_geom() before job_open()")
+        self._replay_setup()
+        _checked(_mod.read_geom)(self._geom)
+        _checked(_mod.job_open)(1 if log else 0)
+
+    def job_step(self, geometry, gradient=False):
+        """Run one geometry of the open job (reusing the density); snapshot results."""
+        self._results = {}
+        self._geom = geometry
+        _checked(_mod.read_geom)(geometry)
+        _checked(_mod.job_step)(1 if gradient else 0)
+        self._ran = True
+        self._snapshot()
+
+    def job_close(self):
+        """Finalize the open job and free the allocated memory."""
+        _checked(_mod.job_close)()
+
+    def _snapshot(self):
         # snapshot all results into Python-owned storage so that a subsequent
         # run() on a different instance cannot overwrite this instance's results
         self._results['total_energy']      = float(_mod.job_total_energy)
@@ -673,6 +712,17 @@ class Calculation:
                 max_cycles=0 if max_cycles is None else int(max_cycles))
         return Result._from_engine(job, self, geometry, name)
 
+    def new_job(self, geometry, reuse_density=True):
+        """Open a persistent :class:`Job` for one molecule.
+
+        Set up the molecule and settings once, then call ``job.run(geom)`` for
+        successive geometries of the **same** molecule (same atoms; only the
+        coordinates change).  Each step reuses the converged density from the
+        previous one as its SCF guess, so later steps converge faster.  Call
+        ``job.delete()`` (or use the job as a context manager) to free the memory.
+        """
+        return Job(self, geometry, reuse_density=reuse_density)
+
     @property
     def input_string(self):
         """The assembled QUICK keyword line + basis (no geometry until run)."""
@@ -881,3 +931,58 @@ class Result:
     def coordinates(self):
         """Atomic coordinates in Angstrom, numpy array of shape (natom, 3)."""
         return self._values['coordinates']
+
+
+class Job:
+    """A persistent QUICK job for one molecule (see :meth:`Calculation.new_job`).
+
+    The molecule and settings are set up once; ``run(geometry)`` then computes
+    successive geometries of the **same** molecule (same atoms, moving
+    coordinates), reusing the converged density from the previous step as the
+    next SCF's initial guess.  Free the allocation with :meth:`delete` or by
+    using the job as a context manager::
+
+        with calc.new_job(geom0) as job:
+            energies = [job.run(g).total_energy for g in geometries]
+    """
+
+    def __init__(self, calc, geometry, reuse_density=True):
+        self._calc = calc
+        self._reuse_density = bool(reuse_density)   # reserved; density is reused
+        self._natoms = _count_atoms(geometry)
+        self._engine = calc._build_engine()
+        self._engine.read_geom(geometry)            # fixes the molecule (atoms)
+        self._engine.job_open(log=calc.log)
+        self._open = True
+
+    def run(self, geometry, gradient=False):
+        """Compute *geometry* (same molecule) and return a :class:`Result`.
+
+        With ``gradient=True`` the nuclear gradient is computed for this step too.
+        """
+        if not self._open:
+            raise RuntimeError("this Job has been deleted")
+        if _count_atoms(geometry) != self._natoms:
+            raise ValueError(
+                "a Job is fixed to one molecule; the atom count changed — "
+                "open a new job for a different molecule")
+        self._engine.job_step(geometry, gradient=gradient)
+        return Result._from_engine(self._engine, self._calc, geometry, name=None)
+
+    def delete(self):
+        """Finalize the job and free its allocated memory."""
+        if self._open:
+            self._engine.job_close()
+            self._open = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.delete()
+
+    def __del__(self):
+        try:
+            self.delete()
+        except Exception:
+            pass
