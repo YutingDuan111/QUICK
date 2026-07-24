@@ -352,6 +352,7 @@ subroutine dlf_run(ierr2 &
   use dlf_allocate, only: allocate,deallocate
   use quick_molspec_module, only: xyz, quick_molspec
   use quick_method_module,only: quick_method
+  use quick_calculated_module, only: quick_qm_struct
   use quick_files_module, only: write_molden
   use quick_molden_module, only: quick_molden
 #ifdef MPIV
@@ -1049,6 +1050,10 @@ subroutine dlf_run(ierr2 &
 
   end do ! main simulation cycle
 
+
+  ! record convergence so callers (e.g. the Python API) can tell an optimized
+  ! geometry from one that merely ran out of cycles
+  quick_qm_struct%opt_converged = tconv
 
   ! Job finished, prepare for shutdown
   if (glob%iopt /= 11 .and. glob%iopt /= 12 .and. glob%iopt /= 9 ) then

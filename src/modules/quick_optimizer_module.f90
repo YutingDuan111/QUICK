@@ -355,6 +355,10 @@ contains
      enddo
 
 
+     ! record convergence so callers (e.g. the Python API) can tell an optimized
+     ! geometry from one that merely ran out of cycles
+     quick_qm_struct%opt_converged = done
+
      if (master) then
         if (done) then
            Write (ioutfile,'("================ OPTIMIZED GEOMETRY INFORMATION ==============")')

@@ -19,7 +19,7 @@ module quick_exception_module
 
   implicit none
   private
-  public :: RaiseException
+  public :: RaiseException, get_exception_message
 
   interface RaiseException
     module procedure raise_exception
@@ -40,12 +40,29 @@ contains
 
   end subroutine raise_exception
 
-  ! picks an error message and prints
+  ! picks an error message and prints it to the output file
   subroutine print_exception(ierr)
 
     implicit none
     integer, intent(in) :: ierr
-    character(len=200) :: msg = ''
+    character(len=200) :: msg
+
+    call get_exception_message(ierr, msg)
+    call PrtErr(OUTFILEHANDLE, trim(msg))
+
+  end subroutine print_exception
+
+  ! returns the error message for an error code, without printing it.
+  ! This is the single source of truth for QUICK's error text: print_exception
+  ! uses it, and callers that are not writing to the output file (e.g. the
+  ! Python API) can retrieve the same message to report it their own way.
+  subroutine get_exception_message(ierr, msg)
+
+    implicit none
+    integer, intent(in) :: ierr
+    character(len=*), intent(out) :: msg
+
+    msg = ''
 
     select case(ierr)
 
@@ -158,8 +175,6 @@ contains
 
     end select
 
-    call PrtErr(OUTFILEHANDLE, trim(msg))
-
-  end subroutine
+  end subroutine get_exception_message
 
 end module quick_exception_module
