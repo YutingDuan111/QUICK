@@ -545,8 +545,8 @@ class Calculation:
     The job type is chosen by which method you call:
 
         calc.get_energy(geometry)  -> single-point energy
-        calc.get_grad(geometry)    -> energy + forces           (Phase 2)
-        calc.geo_opt(geometry)     -> optimized geometry         (Phase 2)
+        calc.get_grad(geometry)    -> energy + forces
+        calc.geo_opt(geometry)     -> optimized geometry
 
     Example::
 

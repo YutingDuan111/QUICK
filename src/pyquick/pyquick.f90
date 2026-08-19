@@ -669,6 +669,12 @@ contains
         ! One-time setup for a fixed molecule. Prerequisites (as for job_run):
         ! set_calc, set_basis and read_geom (the initial geometry) must be done.
         ! do_log: 1 = write <stem>.out, 0 = null device.
+#if defined(GPU)
+        ! GPU builds only: allmod exposes the gpu_* device routines (use is
+        ! subroutine-scoped in Fortran, so job_run's own `use allmod` doesn't
+        ! cover this subroutine -- it needs its own).
+        use allmod
+#endif
         integer, intent(in) :: do_log
         external :: initialize1, read_Job_and_Atom, getMol
         external :: outputCopyright, PrtDate, quick_open
@@ -727,6 +733,13 @@ contains
         call PrtDate(iOutFile, note, ierr)
         call print_quick_io_file(iOutFile, ierr)
 
+#if defined(GPU)
+        ! --- GPU: create context and pick a device (mirrors job_run) ---
+        call gpu_new(ierr)
+        call gpu_init_device(ierr)
+        call gpu_write_info(iOutFile, ierr)
+#endif
+
         call read_Job_and_Atom(ierr)
         if (ierr /= 0) then; call fail('job_open: read_Job_and_Atom failed'); return; end if
 
@@ -763,6 +776,15 @@ contains
         call getMol(ierr)
         if (ierr /= 0) then; call fail('job_open: getMol failed'); return; end if
 
+#if defined(GPU)
+        ! --- GPU: allocate persistent scratch (always gradient-capable -- job_step
+        ! toggles want_gradient per call, so this can't be sized in advance, unlike
+        ! job_run's one-shot `quick_method%grad .or. quick_method%opt`) and upload
+        ! the method settings once for the life of this job. ---
+        call gpu_allocate_scratch(.true.)
+        call upload(quick_method, ierr)
+#endif
+
         job_open_flag = .true.
         job_active    = .true.
     end subroutine job_open
@@ -772,6 +794,9 @@ contains
         ! coordinates (same atoms). want_gradient: 1 = also compute the gradient.
         ! getMol is NOT called, so quick_qm_struct%dense from the previous step
         ! survives and seeds this SCF.
+#if defined(GPU)
+        use allmod
+#endif
         integer, intent(in) :: want_gradient
         integer :: ierr, i, j
 
@@ -795,6 +820,30 @@ contains
         call getEriPrecomputables()
         call schwarzoff()
 
+#if defined(GPU)
+        ! --- GPU: re-upload geometry + basis for this step. gpu_upload_basis and
+        ! gpu_upload_oei also bake in geometry-derived quantities (interatomic
+        ! distances, Gaussian product centers), so this must repeat every step,
+        ! not just once in job_open -- see quick_api_module's run_quick, which
+        ! does the same full re-upload unconditionally on every call. ---
+        call gpu_setup(natom, nbasis, quick_molspec%nElec, quick_molspec%imult, &
+                       quick_molspec%molchg, quick_molspec%iAtomType)
+        call gpu_upload_xyz(xyz)
+        call gpu_upload_atom_and_chg(quick_molspec%iattype, quick_molspec%chg)
+        call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
+            ncontract, itype, aexp, dcoeff, &
+            quick_basis%first_basis_function, quick_basis%last_basis_function, &
+            quick_basis%first_shell_basis_function, quick_basis%last_shell_basis_function, &
+            quick_basis%ncenter, quick_basis%kstart, quick_basis%katom, &
+            quick_basis%ktype, quick_basis%kprim, quick_basis%kshell, quick_basis%Ksumtype, &
+            quick_basis%Qnumber, quick_basis%Qstart, quick_basis%Qfinal, &
+            quick_basis%Qsbasis, quick_basis%Qfbasis, &
+            quick_basis%gccoeff, quick_basis%cons, quick_basis%gcexpo, quick_basis%KLMN)
+        call gpu_upload_cutoff_matrix(Ycutoff, cutPrim)
+        call gpu_upload_oei(quick_molspec%nExtAtom, quick_molspec%extxyz, &
+                            quick_molspec%extchg, ierr)
+#endif
+
         if (want_gradient /= 0) then
             if (quick_method%unrst) then
                 call oshell_gradient(ierr)
@@ -807,6 +856,25 @@ contains
             if (ierr /= 0) then; call fail('job_step: getEnergy failed'); return; end if
         end if
 
+#if defined(GPU)
+        ! --- GPU: intentionally NOT calling gpu_cleanup() here. ---
+        ! quick_api_module's run_quick calls gpu_cleanup() at this exact point to free
+        ! the geometry-dependent basis/xyz arrays before the next step re-uploads them
+        ! (see gpu_upload_molspecs). That call segfaults: confirmed reproducible even
+        ! by adding the identical call to job_run's already-verified one-shot teardown
+        ! (src/gpu/cuda/gpu.cu's gpu_cleanup_ crashes deep in its SAFE_DELETE sequence,
+        ! in the gpu_basis field group, before ever reaching gpu_calculated/gpu_cutoff --
+        ! a pre-existing bug in gpu_cleanup()/gpu_buffer_type, not something introduced
+        ! here; job_run never exercises it since it tears down the whole context instead).
+        ! Trade-off accepted for now: each job_step's gpu_upload_basis/gpu_setup calls
+        ! re-`new` their device buffers without freeing the previous step's, so a
+        ! persistent GPU job leaks a basis-sized chunk of device memory per step. Bounded
+        ! by basis size (not scratch/SCF-iteration size) and freed at job_close/job_destroy
+        ! via gpu_delete's cudaDeviceReset. Fine for short-to-moderate step counts; will
+        ! exhaust device memory on very long-running jobs. Follow-up: root-cause and fix
+        ! gpu_cleanup() itself, then call it here instead of skipping it.
+#endif
+
         call harvest_results(want_gradient /= 0)
     end subroutine job_step
 
@@ -814,10 +882,36 @@ contains
         external :: finalize
         integer :: ierr
         ierr = 0
-        if (job_active) call finalize(iOutFile, ierr, 1)
+        if (job_active) then
+            ! Only tear down the GPU context if THIS call opened one (job_open_flag).
+            ! job_active is also left .true. by the one-shot job_run, which already
+            ! tore its own GPU context down (gpu_delete) before returning -- calling
+            ! job_gpu_teardown() again there would double-free the (still-dangling,
+            ! gpu_delete_ never nulls the global `gpu` pointer) device context.
+            if (job_open_flag) call job_gpu_teardown()
+            call finalize(iOutFile, ierr, 1)
+        end if
         job_active    = .false.
         job_open_flag = .false.
     end subroutine job_close
+
+    subroutine job_gpu_teardown()
+        ! Shared GPU-context teardown for job_close and job_destroy. Either one
+        ! can be the last call on an open persistent job -- job_destroy also
+        ! backstops __init__.py's PyQuick.__del__ -- so both must free the
+        ! device context, not just job_close. Mirrors quick_api_module's
+        ! delete_quick_job, including the libxc GPU cleanup that job_run's
+        ! one-shot teardown skips (harmless there for non-DFT jobs, but a
+        ! persistent job can run DFT).
+#if defined(GPU)
+        use allmod
+        integer :: ierr
+        ierr = 0
+        call delete(quick_method, ierr)
+        call gpu_deallocate_scratch(.true.)
+        call gpu_delete(ierr)
+#endif
+    end subroutine job_gpu_teardown
 
     subroutine harvest_results(did_gradient)
         ! Copy energies/properties out of QUICK's module state after a run.
@@ -854,8 +948,12 @@ contains
         integer :: ierr
         ierr = 0
         if (job_active) then
+            ! See job_close: only tear down the GPU context if a persistent job
+            ! (job_open) actually left one open.
+            if (job_open_flag) call job_gpu_teardown()
             call finalize(iOutFile, ierr, 1)
-            job_active = .false.
+            job_active    = .false.
+            job_open_flag = .false.
         end if
     end subroutine job_destroy
 

@@ -547,7 +547,7 @@ jobs:
           if [ "$RUNNER_OS" == "macOS" ]; then
             export DYLD_LIBRARY_PATH=$PWD/install/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}
           fi
-          python3 test/pyquick_ene_H2O_rhf_sto3g.py
+          python3 src/pyquick/test/pyquick_ene_H2O_rhf_sto3g.py
       - name: 'Run Tests for Serial Version'
         run: |
           if [ ${{ matrix.compiler-type }} == 'INTELLLVM' ]; then

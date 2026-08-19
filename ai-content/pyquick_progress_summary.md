@@ -86,7 +86,7 @@ committed. No remote push yet — `origin git@github.com:YutingDuan111/QUICK.git
 ## Next steps
 
 1. Commit + push the working tree; pull on the SSH box.
-2. **GPU** — see `ai-content/pyquick_gpu_approach.md`. The guarded GPU block is already in
+2. **GPU** — see `ai-content/pyquick_gpu.md`. The guarded GPU block is already in
    `pyquick.f90`; the build must be changed to preprocess + link the GPU library.
 3. (Later) per-step GPU uploads in `job_step` for the persistent Job; ZPE/frequencies are broken
    in QUICK (`FREQ` segfaults) so out of scope; cutoff named-parameters are optional (the
