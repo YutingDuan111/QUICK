@@ -105,13 +105,21 @@ def test_input_string_contains_tokens():
 
 
 # ---------------------------------------------------------------------------
-# geo_opt is still a Phase-2 stub (gradients are implemented; see below)
+# geo_opt: DL-Find (default) optimization
 # ---------------------------------------------------------------------------
 
-def test_geo_opt_not_implemented():
-    calc = pyquick.Calculation(method='HF', basis='STO-3G')
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        calc.geo_opt(WATER)
+def test_geo_opt_optimizes_water():
+    calc = pyquick.Calculation(
+        method='HF', basis='STO-3G',
+        keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
+    r = calc.geo_opt(WATER)
+    assert r.converged
+    assert r.optimized_coordinates.shape == (3, 3)
+    assert math.isfinite(r.total_energy)
+    # the optimized structure must not be higher in energy than the input one
+    assert r.total_energy <= REF_ENERGY + 1e-6
+    # `coordinates` still holds the input geometry, not the optimized one
+    assert r.coordinates[0] == pytest.approx([-0.33840, 0.00380, 0.23923], abs=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +164,16 @@ def test_conditional_energies_gated():
 
 
 def test_unrequested_property_raises_attributeerror():
-    """Not-requested properties raise AttributeError naming the property to request."""
+    """Not-requested opt-in properties raise AttributeError naming the property to request.
+
+    density_matrix (and mo_energies) are NOT gated this way: they're always-on
+    extras every SCF computes for free, so they're available even when not named
+    in `properties` (see _ALWAYS_ON_PROPERTIES in __init__.py).
+    """
     result = _energy()
     with pytest.raises(AttributeError, match="mulliken_charges"):
         _ = result.mulliken
-    with pytest.raises(AttributeError, match="density_matrix"):
-        _ = result.density_matrix
+    assert result.density_matrix.ndim == 2
 
 
 def test_requested_charges_available():

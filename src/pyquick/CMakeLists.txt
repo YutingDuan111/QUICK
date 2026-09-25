@@ -76,42 +76,97 @@ execute_process(
 set(_PYQUICK_SO "${CMAKE_CURRENT_BINARY_DIR}/_pyquick${PYTHON_EXT_SUFFIX}")
 
 # ---------------------------------------------------------------------------
-# 4. Build the .so via f2py as a custom command
+# 4. Select the libquick flavour to bind against: serial (CPU) or GPU.
 #
-#    Include path: build-tree .mod files for the serial libquick target.
-#    The directory is ${CMAKE_BINARY_DIR}/amber-modules/quick/serial, which
-#    is set by config_module_dirs(libquick quick/serial ...) in src/CMakeLists.txt
-#    and is fully populated after libquick has been compiled (DEPENDS libquick).
+#    pyquick.f90 carries GPU code inside #if defined(GPU) guards (mirroring
+#    main.f90). The GPU macro is what src/CMakeLists.txt defines on
+#    libquick_${QUICK_GPU_TARGET_NAME}, and it covers BOTH the cuda and hip
+#    backends -- one source, two build recipes. So a GPU pyquick differs from
+#    the CPU one only in these three things:
 #
-#    Link path: resolved at build time via $<TARGET_FILE_DIR:libquick>, so
-#    -L always points to the actual location of libquick.so regardless of
-#    CMAKE_INSTALL_PREFIX.
+#      * -DGPU on the Fortran compile, to activate the guarded blocks;
+#      * the .mod directory (quick/cuda or quick/hip, not quick/serial), which
+#        is where the gpu_* interfaces live;
+#      * linking libquick_cuda / libquick_hip instead of the serial libquick.
+#
+#    -cpp and -I<src/util> are unconditional: the guards must be *evaluated*
+#    even on the CPU build (where they evaluate to nothing), and preprocessing
+#    means "#include util.fh" now has to be resolved by cpp rather than by
+#    gfortran's own include handling.
 # ---------------------------------------------------------------------------
+set(_PYQUICK_F90FLAGS "-cpp -I${CMAKE_SOURCE_DIR}/src/util")
+set(_PYQUICK_EXTRA_LINK_ARGS "")
+
+if(CUDA)
+    # CUDA=TRUE covers both backends; HIP=TRUE additionally flips
+    # QUICK_GPU_TARGET_NAME to "hip" and QUICK_GPU_PLATFORM to "HIP".
+    set(_PYQUICK_LIBTARGET libquick_${QUICK_GPU_TARGET_NAME})
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/${QUICK_GPU_TARGET_NAME}")
+    set(_PYQUICK_LIBNAME "quick_${QUICK_GPU_TARGET_NAME}")
+    string(APPEND _PYQUICK_F90FLAGS " -DGPU -D${QUICK_GPU_PLATFORM}")
+
+    if(NOT HIP)
+        # libquick_cuda is a shared library, so cublas/cusolver/cudart are
+        # normally pulled in transitively. Name them anyway: f2py links with
+        # gfortran, not the CUDA toolchain, so nothing guarantees the device
+        # runtime is on the link line. FindCUDA gives full paths; f2py's meson
+        # backend wants -L/-l, hence the split.
+        foreach(_cudalib "${CUDA_CUDART_LIBRARY}" "${CUDA_cublas_LIBRARY}" "${CUDA_cusolver_LIBRARY}")
+            if(_cudalib)
+                get_filename_component(_cudalibdir "${_cudalib}" DIRECTORY)
+                list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_cudalibdir}")
+            endif()
+        endforeach()
+        list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
+        list(APPEND _PYQUICK_EXTRA_LINK_ARGS -lcudart -lcublas -lcusolver)
+    endif()
+
+    message(STATUS "pyquick: binding against GPU libquick (${_PYQUICK_LIBNAME})")
+else()
+    set(_PYQUICK_LIBTARGET libquick)
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/serial")
+    set(_PYQUICK_LIBNAME "quick")
+    message(STATUS "pyquick: binding against serial libquick (CPU)")
+endif()
+
+# ---------------------------------------------------------------------------
+# 5. Build the .so via f2py as a custom command
+#
+#    Include path: build-tree .mod files for the selected libquick target,
+#    set by config_module_dirs(...) in src/CMakeLists.txt and fully populated
+#    once that library has compiled (hence DEPENDS ${_PYQUICK_LIBTARGET}).
+#
+#    Link path: resolved at build time via $<TARGET_FILE_DIR:...>, so -L always
+#    points at the actual library location regardless of CMAKE_INSTALL_PREFIX.
+#
 #    Backend: force the meson backend. f2py's legacy distutils backend is
 #    removed on Python 3.12+ and is already broken on 3.9 with modern numpy
 #    (numpy.distutils imports distutils.msvccompiler, which no longer exists),
 #    so meson is the portable choice. Requires meson + ninja (checked above).
+# ---------------------------------------------------------------------------
 add_custom_command(
     OUTPUT  "${_PYQUICK_SO}"
     COMMAND ${Python3_EXECUTABLE} -m numpy.f2py
                 --backend meson
                 -c "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
-                "-I${CMAKE_BINARY_DIR}/amber-modules/quick/serial"
-                "-L$<TARGET_FILE_DIR:libquick>"
-                -lquick
+                "--f90flags=${_PYQUICK_F90FLAGS}"
+                "-I${_PYQUICK_MODDIR}"
+                "-L$<TARGET_FILE_DIR:${_PYQUICK_LIBTARGET}>"
+                "-l${_PYQUICK_LIBNAME}"
+                ${_PYQUICK_EXTRA_LINK_ARGS}
                 -m _pyquick
-    DEPENDS libquick "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
+    DEPENDS ${_PYQUICK_LIBTARGET} "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     COMMENT "Building _pyquick Python extension via f2py"
     VERBATIM)
 
 # ---------------------------------------------------------------------------
-# 5. Named target included in the default ALL build
+# 6. Named target included in the default ALL build
 # ---------------------------------------------------------------------------
 add_custom_target(pyquick ALL DEPENDS "${_PYQUICK_SO}")
 
 # ---------------------------------------------------------------------------
-# 6. Install rules
+# 7. Install rules
 #    Both the compiled extension and the Python package glue go into
 #    <prefix>/lib/pyquick/ so that after "source quick.rc" (which prepends
 #    <prefix>/lib to PYTHONPATH) the package is importable as "import pyquick".
