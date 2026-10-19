@@ -870,3 +870,33 @@ def test_density_matrix_meaning_documented():
     assert np.allclose(rhf.density_matrix, 2 * uhf.density_matrix, atol=1e-7)
     doc = pyquick.Result.density_matrix.__doc__.lower()
     assert 'total' in doc and 'alpha' in doc and 'unrestricted' in doc
+
+
+# ---------------------------------------------------------------------------
+# Persistent DFT job with a moving geometry
+#
+# The DFT grid depends on the geometry.  job_step must free the previous
+# step's grid before a new one is built (as QUICK's own API does between MD
+# steps); without that the GPU build corrupted the heap once the grid size
+# changed, crashing on job close.  The CPU build happened to survive, so on
+# CPU this guards the energies; on a GPU build it also guards the crash.
+# ---------------------------------------------------------------------------
+
+WATER_STRETCHED = """
+    O  -0.33840   0.00380   0.23923
+    H  -0.33508  -0.00193  -0.83813
+    H   0.67856  -0.00193   0.59530
+"""
+
+
+def test_persistent_dft_job_with_moving_geometry():
+    calc = pyquick.PyQuick('B3LYP', 'STO-3G', keywords=LOOSE, log=False)
+    geometries = [WATER, WATER_STRETCHED, WATER, WATER_STRETCHED]
+    with calc.new_job(WATER) as job:
+        steps = [job.run(g, gradient=(k == 3)) for k, g in enumerate(geometries)]
+    # each step matches a one-shot run at the same geometry (also proves the
+    # process survived closing the job)
+    ref = {g: calc.get_energy(g).total_energy for g in (WATER, WATER_STRETCHED)}
+    for g, r in zip(geometries, steps):
+        assert r.total_energy == pytest.approx(ref[g], abs=TOL)
+    assert steps[3].gradient.shape == (3, 3)

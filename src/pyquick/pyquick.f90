@@ -13,6 +13,7 @@ module pyquick
     use quick_cutoff_module, only : schwarzoff
     use quick_eri_cshell_module, only : getEriPrecomputables
     use quick_sad_guess_module, only : getSadGuess
+    use quick_gridpoints_module, only : quick_dft_grid, deform_dft_grid
     use quick_grad_cshell_module, only : cshell_gradient
     use quick_grad_oshell_module, only : oshell_gradient
     use quick_optimizer_module, only : lopt
@@ -75,6 +76,7 @@ module pyquick
     ! the molecule and basis are allocated once and the density is reused across
     ! steps (only coordinates change), until job_close frees everything.
     logical :: job_open_flag = .false.
+    integer :: job_nsteps = 0        ! steps run on the open persistent job
 
     ! scalar results (always available after a successful job_run)
     ! job_e_core is QUICK's ECore: the core-core NUCLEAR REPULSION energy
@@ -810,6 +812,7 @@ contains
 
         job_open_flag = .true.
         job_active    = .true.
+        job_nsteps    = 0
     end subroutine job_open
 
     subroutine job_step(want_gradient)
@@ -839,6 +842,12 @@ contains
                 xyz(j, i) = geom_coords(j, i) * A_TO_BOHRS
             end do
         end do
+
+        ! DFT: free the previous step's grid before getEnergy builds one for the
+        ! new geometry, as quick_api_module's run_quick does between MD steps.
+        ! Otherwise the grid is rebuilt over the old arrays; once its size changes
+        ! with the geometry, the GPU build corrupts the heap (found on job close).
+        if (job_nsteps > 0 .and. quick_method%DFT) call deform_dft_grid(quick_dft_grid)
 
         call getEriPrecomputables()
         call schwarzoff()
@@ -884,24 +893,19 @@ contains
 
 #if defined(GPU)
         ! --- GPU: intentionally NOT calling gpu_cleanup() here. ---
-        ! quick_api_module's run_quick calls gpu_cleanup() at this exact point to free
-        ! the geometry-dependent basis/xyz arrays before the next step re-uploads them
-        ! (see gpu_upload_molspecs). That call segfaults: confirmed reproducible even
-        ! by adding the identical call to job_run's already-verified one-shot teardown
-        ! (src/gpu/cuda/gpu.cu's gpu_cleanup_ crashes deep in its SAFE_DELETE sequence,
-        ! in the gpu_basis field group, before ever reaching gpu_calculated/gpu_cutoff --
-        ! a pre-existing bug in gpu_cleanup()/gpu_buffer_type, not something introduced
-        ! here; job_run never exercises it since it tears down the whole context instead).
-        ! Trade-off accepted for now: each job_step's gpu_upload_basis/gpu_setup calls
-        ! re-`new` their device buffers without freeing the previous step's, so a
-        ! persistent GPU job leaks a basis-sized chunk of device memory per step. Bounded
-        ! by basis size (not scratch/SCF-iteration size) and freed at job_close/job_destroy
-        ! via gpu_delete's cudaDeviceReset. Fine for short-to-moderate step counts; will
-        ! exhaust device memory on very long-running jobs. Follow-up: root-cause and fix
-        ! gpu_cleanup() itself, then call it here instead of skipping it.
+        ! quick_api_module's run_quick calls it at this point to free the step's
+        ! geometry-dependent device arrays, but here it segfaults on its first
+        ! call: gdb shows it deleting gpu->gpu_cutoff->cutMatrix, whose object is
+        ! already corrupted. That object is damaged in QUICK's normal GPU SCF path
+        ! (freeing the previous iteration's cutMatrix in gpu_upload_cutoff_ breaks
+        ! even the plain quick.cuda binary), so the fault is a host-memory
+        ! corruption in the GPU code, not in pyquick. Until it is found, each step
+        ! leaks its device arrays (~570 KiB/step for benzene/6-31G*), reclaimed at
+        ! job_close/job_destroy by gpu_delete's cudaDeviceReset.
 #endif
 
         call harvest_results(want_gradient /= 0)
+        job_nsteps = job_nsteps + 1
     end subroutine job_step
 
     subroutine job_close()
