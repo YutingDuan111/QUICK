@@ -152,14 +152,14 @@ def test_energy_decomposition_identities():
 
 
 def test_conditional_energies_gated():
-    """dispersion only present if requested; external charge only if EXTCHARGES set.
+    """dispersion only present if requested; external charge only if point_charges given.
 
     The AttributeError must explain *why* the value is unavailable and how to enable it.
     """
-    r = _energy()   # no D* keyword, no EXTCHARGES
+    r = _energy()   # no D* keyword, no point_charges
     with pytest.raises(AttributeError, match="(?i)dispersion"):
         _ = r.e_dispersion
-    with pytest.raises(AttributeError, match="EXTCHARGES"):
+    with pytest.raises(AttributeError, match="point_charges"):
         _ = r.e_external_charge
 
 
@@ -386,3 +386,132 @@ def test_job_cannot_be_copied(fn):
     with _calc().new_job(WATER) as job:
         with pytest.raises(TypeError):
             fn(job)
+
+
+# ---------------------------------------------------------------------------
+# point_charges=: external point charges, passed per call
+#
+# Each charge is (x, y, z, q) with x, y, z in Angstrom.  The charges act on the
+# molecule (SCF density, nuclear repulsion, gradient).  Their mutual repulsion
+# ECharge is reported as e_external_charge but is NEVER part of total_energy,
+# matching the quick binary.  References below come from the quick binary on
+# the same inputs (water + two +1 charges 1 Angstrom apart).
+# ---------------------------------------------------------------------------
+
+CHARGES = [(5.0, 0.0, 0.0, 1.0), (6.0, 0.0, 0.0, 1.0)]
+REF_PC_ENERGY = -74.939356355     # quick binary, EXTCHARGES, cutoff 1e-9
+REF_PC_ECHARGE = 0.529177209      # 1 / (1 Angstrom in bohr)
+REF_PC_OPT_ENERGY = -74.956315292 # quick binary, EXTCHARGES OPTIMIZE
+REF_PC_GRADIENT = [               # quick binary, EXTCHARGES GRADIENT, Hartree/Bohr
+    [-0.0402633390,  0.0004027813,  0.0303094245],
+    [-0.0231180315, -0.0002168710, -0.0797239350],
+    [ 0.0648798397, -0.0001766444,  0.0497540855],
+]
+ANG_TO_BOHR = 1.0 / 0.52917721067
+
+
+def _pc_calc(tight=False):
+    kw = ({'cutoff': '1.0e-11', 'denserms': '1.0e-8'} if tight
+          else {'cutoff': '1.0e-9', 'denserms': '1.0e-6'})
+    return pyquick.PyQuick(method='HF', basis='STO-3G', keywords=kw, log=False)
+
+
+def test_point_charges_energy_matches_binary():
+    r = _pc_calc().get_energy(WATER, point_charges=CHARGES)
+    assert r.total_energy == pytest.approx(REF_PC_ENERGY, abs=TOL)
+    assert r.e_external_charge == pytest.approx(REF_PC_ECHARGE, abs=1e-8)
+
+
+def test_point_charges_echarge_not_in_total_energy():
+    """total_energy = e_electronic + nuclear_repulsion; ECharge is reported only."""
+    r = _pc_calc().get_energy(WATER, point_charges=CHARGES)
+    assert r.total_energy == pytest.approx(
+        r.e_electronic + r.nuclear_repulsion, abs=1e-10)
+    assert r.e_external_charge > 0.5      # large, so leaving it out is a real check
+
+
+def test_point_charges_add_atom_charge_repulsion():
+    """nuclear_repulsion gains exactly sum_i sum_j Z_i q_j / r_ij (bohr)."""
+    calc = _pc_calc()
+    vac = calc.get_energy(WATER)
+    pc = calc.get_energy(WATER, point_charges=CHARGES)
+    atoms = [(ln.split()[0], [float(v) for v in ln.split()[1:4]])
+             for ln in WATER.strip().splitlines()]
+    z = {'O': 8.0, 'H': 1.0}
+    expected = 0.0
+    for sym, a in atoms:
+        for *c, q in CHARGES:
+            r_bohr = math.dist(a, c) * ANG_TO_BOHR
+            expected += z[sym] * q / r_bohr
+    assert pc.nuclear_repulsion - vac.nuclear_repulsion == pytest.approx(expected, abs=1e-8)
+
+
+def test_point_charges_gradient_matches_binary():
+    r = _pc_calc(tight=True).get_grad(WATER, point_charges=CHARGES)
+    assert r.e_external_charge == pytest.approx(REF_PC_ECHARGE, abs=1e-8)
+    for got, ref in zip(r.gradient, REF_PC_GRADIENT):
+        assert list(got) == pytest.approx(ref, abs=1e-6)
+    # the charges exert a net force, unlike the isolated molecule
+    assert abs(r.gradient.sum(axis=0)[0]) > 1e-3
+
+
+def test_point_charges_geo_opt_matches_binary():
+    r = _pc_calc(tight=True).geo_opt(WATER, point_charges=CHARGES)
+    assert r.converged
+    assert r.total_energy == pytest.approx(REF_PC_OPT_ENERGY, abs=TOL)
+    assert r.e_external_charge == pytest.approx(REF_PC_ECHARGE, abs=1e-8)
+
+
+def test_point_charges_do_not_leak_into_next_call():
+    """Charges belong to one call; the next call without them is in vacuum."""
+    calc = _pc_calc()
+    with_pc = calc.get_energy(WATER, point_charges=CHARGES)
+    vac = calc.get_energy(WATER)
+    assert with_pc.total_energy == pytest.approx(REF_PC_ENERGY, abs=TOL)
+    assert vac.total_energy == pytest.approx(REF_ENERGY, abs=TOL)
+    with pytest.raises(AttributeError, match="point_charges"):
+        _ = vac.e_external_charge
+
+
+def test_point_charges_accepts_numpy_array():
+    import numpy as np
+    r = _pc_calc().get_energy(WATER, point_charges=np.array(CHARGES))
+    assert r.total_energy == pytest.approx(REF_PC_ENERGY, abs=TOL)
+
+
+def test_single_point_charge_has_zero_echarge():
+    """One charge has no partner: e_external_charge is available and 0."""
+    r = _pc_calc().get_energy(WATER, point_charges=[CHARGES[0]])
+    assert r.e_external_charge == 0.0
+    assert r.total_energy != pytest.approx(REF_ENERGY, abs=1e-4)   # still felt
+
+
+@pytest.mark.parametrize("bad", [
+    [(5.0, 0.0, 0.0)],                 # missing charge
+    [(5.0, 0.0, 0.0, 1.0, 2.0)],       # extra column
+    [],                                # empty
+    [('a', 0.0, 0.0, 1.0)],            # not numeric
+])
+def test_point_charges_malformed_raises(bad):
+    with pytest.raises(ValueError, match="point_charges"):
+        _pc_calc().get_energy(WATER, point_charges=bad)
+
+
+def test_extcharges_keyword_rejected():
+    """The bare EXTCHARGES keyword used to run silently in vacuum; now it
+    points the user to point_charges=."""
+    with pytest.raises(ValueError, match="point_charges"):
+        pyquick.PyQuick(method='HF', basis='STO-3G', keywords={'EXTCHARGES': None})
+    with pytest.raises(ValueError, match="point_charges"):
+        pyquick.PyQuick(method='HF', basis='STO-3G', keywords={'extcharges': None})
+
+
+def test_persistent_job_with_point_charges():
+    """new_job(point_charges=) fixes the charges for every step of the job."""
+    calc = _pc_calc()
+    with calc.new_job(WATER, point_charges=CHARGES) as job:
+        r1 = job.run(WATER)
+        r2 = job.run(WATER)
+    for r in (r1, r2):
+        assert r.total_energy == pytest.approx(REF_PC_ENERGY, abs=TOL)
+        assert r.e_external_charge == pytest.approx(REF_PC_ECHARGE, abs=1e-8)

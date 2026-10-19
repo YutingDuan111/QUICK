@@ -23,6 +23,7 @@ module pyquick
     private
     public :: set_calc, set_basis, set_method, clear_methods, read_geom, &
               had_error, error_message, print_input, input_string, &
+              set_point_charges, clear_point_charges, &
               job_run, job_destroy, job_set_output, &
               job_open, job_step, job_close, &
               job_active, &
@@ -54,6 +55,11 @@ module pyquick
 
     ! atom count stored by read_geom so job_run knows natom before alloc
     integer :: geom_natom = 0
+
+    ! external point charges for the following runs, set from Python:
+    ! pc_data(1:3,i) = Angstrom coordinates, pc_data(4,i) = charge
+    integer :: pc_n = 0
+    double precision, allocatable :: pc_data(:,:)
 
     ! output file stem (default 'pyquick_job')
     character(len=80) :: output_stem = 'pyquick_job'
@@ -515,12 +521,14 @@ contains
 
         ! set natom (module-level target) BEFORE alloc uses it
         natom = geom_natom
+        call prepare_point_charges()
 
         call alloc(quick_molspec, .false., ierr)
         if (ierr /= 0) then
             call fail('job_run: alloc(quick_molspec) failed')
             return
         end if
+        call inject_point_charges()
 
         ! --- inject geometry into QUICK module-level state ---
 
@@ -744,8 +752,10 @@ contains
         if (ierr /= 0) then; call fail('job_open: read_Job_and_Atom failed'); return; end if
 
         natom = geom_natom
+        call prepare_point_charges()
         call alloc(quick_molspec, .false., ierr)
         if (ierr /= 0) then; call fail('job_open: alloc(quick_molspec) failed'); return; end if
+        call inject_point_charges()
 
         ! atom types (deduplicate by atomic number) + initial coordinates
         natm_type = 0
@@ -1106,6 +1116,44 @@ contains
     ! Private helpers
     ! -----------------------------------------------------------------------
 
+    subroutine set_point_charges(charges, n)
+        ! Set the external point charges for the following runs (replaces any
+        ! previous set): charges(1:3,i) in Angstrom, charges(4,i) the charge.
+        integer, intent(in) :: n
+        double precision, intent(in) :: charges(4, n)
+
+        if (allocated(pc_data)) deallocate(pc_data)
+        allocate(pc_data(4, n))
+        pc_data = charges
+        pc_n = n
+    end subroutine set_point_charges
+
+    subroutine clear_point_charges()
+        if (allocated(pc_data)) deallocate(pc_data)
+        pc_n = 0
+    end subroutine clear_point_charges
+
+    subroutine prepare_point_charges()
+        ! Before alloc(quick_molspec), which sizes extxyz/extchg from nextatom.
+        ! initialize1 resets nextatom to 0 and isTemplate skips QUICK's own
+        ! reading of the charges, so pyquick sets the count itself. Drop any
+        ! arrays left from an earlier run so alloc sizes them for this one.
+        if (allocated(quick_molspec%extxyz)) deallocate(quick_molspec%extxyz)
+        if (allocated(quick_molspec%extchg)) deallocate(quick_molspec%extchg)
+        quick_molspec%nextatom = pc_n
+    end subroutine prepare_point_charges
+
+    subroutine inject_point_charges()
+        ! After alloc(quick_molspec): copy the charges in (Angstrom -> Bohr),
+        ! as set_quick_molspecs in quick_api_module does for the AMBER API.
+        integer :: i
+
+        do i = 1, pc_n
+            quick_molspec%extxyz(1:3, i) = pc_data(1:3, i) * A_TO_BOHRS
+            quick_molspec%extchg(i)      = pc_data(4, i)
+        end do
+    end subroutine inject_point_charges
+
     function build_keyword_line() result(text)
         character(len=:), allocatable :: text
         integer :: i
@@ -1124,6 +1172,10 @@ contains
         end if
 
         if (has_basis) text = trim(text) // ' ' // trim(basis_token)
+
+        ! EXTCHARGES makes QUICK report ECharge; the charges themselves are
+        ! injected by prepare_/inject_point_charges, not read from an input file
+        if (pc_n > 0) text = trim(text) // ' EXTCHARGES'
 
     end function build_keyword_line
 
