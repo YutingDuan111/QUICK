@@ -18,3 +18,5 @@ make.in
 .pytest_cache/
 __pycache__/
 *.py[cod]
+src/pyquick/test/output/
+.ipynb_checkpoints/
