@@ -1,3 +1,4 @@
+import atexit as _atexit
 import copy as _copy
 
 import numpy as _np
@@ -12,6 +13,78 @@ except ImportError as e:
             "before importing this module."
         ) from e
     raise
+
+
+# ---------------------------------------------------------------------------
+# MPI (an extension built with cmake -DMPI=TRUE, bound to libquick_mpi)
+#
+# Python owns MPI: importing mpi4py starts it, and mpi4py finalizes it at exit.
+# QUICK borrows it in library mode (set_mpi), the way Amber does.  Every QUICK
+# calculation runs on all ranks of MPI_COMM_WORLD; rank 0 reads the results
+# from Fortran and broadcasts them, so every rank returns the same Result.
+# Serial and GPU builds never import mpi4py.
+# ---------------------------------------------------------------------------
+
+_MPI_BUILD = bool(_mod.get_build_info())
+_COMM = None
+if _MPI_BUILD:
+    try:
+        from mpi4py import MPI as _MPI
+    except ImportError as e:
+        raise ImportError(
+            "this pyquick was built with MPI and needs mpi4py, built against the "
+            "same MPI library as QUICK:  MPICC=<path to mpicc> python -m pip "
+            "install --no-binary=mpi4py mpi4py"
+        ) from e
+    _COMM = _MPI.COMM_WORLD
+    _mod.set_mpi(_COMM.Get_rank(), _COMM.Get_size())
+
+
+def mpi_enabled():
+    """True if this pyquick was built with MPI (one calculation runs on all ranks)."""
+    return _MPI_BUILD
+
+
+def mpi_rank():
+    """This process's rank in MPI_COMM_WORLD (0 when not built with MPI)."""
+    return _COMM.Get_rank() if _MPI_BUILD else 0
+
+
+def mpi_size():
+    """Number of MPI ranks a calculation runs on (1 when not built with MPI)."""
+    return _COMM.Get_size() if _MPI_BUILD else 1
+
+
+# QUICK's finalize is a collective call under MPI (it gathers timings from every
+# rank), so it must run at the same point on all ranks: never from __del__, whose
+# timing belongs to the garbage collector, and never after mpi4py has finalized
+# MPI at exit.  Under MPI, __del__ only records that a cleanup is due; it runs at
+# the next run()/job_open(), or in the exit hook below.
+_cleanup_due = False
+
+
+def _request_cleanup():
+    global _cleanup_due
+    _cleanup_due = True
+
+
+def _run_due_cleanup():
+    global _cleanup_due
+    if _cleanup_due:
+        _cleanup_due = False
+        if _mod.job_active:
+            _mod.job_destroy()
+
+
+def _mpi_exit_hook():
+    # registered after mpi4py started MPI, so it runs before mpi4py's own
+    # finalization (exit hooks run last-in, first-out)
+    if _mod.job_active:
+        _mod.job_destroy()
+
+
+if _MPI_BUILD:
+    _atexit.register(_mpi_exit_hook)
 
 
 def _checked(fn):
@@ -183,6 +256,7 @@ class _PyQuickEngine:
             raise RuntimeError("call set_basis() before run()")
         if self._geom is None:
             raise RuntimeError("call read_geom() before run()")
+        _run_due_cleanup()
         # replay this instance's state into the Fortran singleton
         _mod.clear_methods()
         _checked(_mod.set_calc)(self._calc)
@@ -196,7 +270,7 @@ class _PyQuickEngine:
         self._replay_point_charges()
         _checked(_mod.job_run)(jobtype, 1 if log else 0, int(max_cycles))
         self._ran = True
-        self._snapshot()
+        self._share_results()
 
     def _replay_setup(self):
         """Replay this instance's calc/basis/methods into the Fortran singleton."""
@@ -218,6 +292,7 @@ class _PyQuickEngine:
             raise RuntimeError("call set_basis() before job_open()")
         if self._geom is None:
             raise RuntimeError("call read_geom() before job_open()")
+        _run_due_cleanup()
         self._replay_setup()
         _checked(_mod.read_geom)(self._geom)
         _checked(_mod.job_open)(1 if log else 0)
@@ -229,11 +304,24 @@ class _PyQuickEngine:
         _checked(_mod.read_geom)(geometry)
         _checked(_mod.job_step)(1 if gradient else 0)
         self._ran = True
-        self._snapshot()
+        self._share_results()
 
     def job_close(self):
         """Finalize the open job and free the allocated memory."""
         _checked(_mod.job_close)()
+
+    def _share_results(self):
+        """Snapshot the results; under MPI, rank 0 does it and broadcasts them.
+
+        After a run only rank 0 holds complete results in Fortran (the others
+        hold partial sums or nothing), so workers never read them.
+        """
+        if _MPI_BUILD:
+            if _COMM.Get_rank() == 0:
+                self._snapshot()
+            self._results = _COMM.bcast(self._results, root=0)
+        else:
+            self._snapshot()
 
     def _snapshot(self):
         # snapshot all results into Python-owned storage so that a subsequent
@@ -314,9 +402,13 @@ class _PyQuickEngine:
 
     def __del__(self):
         # Only finalize QUICK if this object successfully ran a calculation.
+        # Under MPI, defer it to a point every rank reaches (see _request_cleanup).
         try:
             if self._ran and _mod.job_active:
-                _mod.job_destroy()
+                if _MPI_BUILD:
+                    _request_cleanup()
+                else:
+                    _mod.job_destroy()
         except Exception:
             pass
 
@@ -1191,6 +1283,11 @@ class Job:
 
     def __del__(self):
         try:
-            self.delete()
+            if _MPI_BUILD and self._open:
+                # QUICK's finalize is collective: defer it (see _request_cleanup)
+                self._open = False
+                _request_cleanup()
+            else:
+                self.delete()
         except Exception:
             pass

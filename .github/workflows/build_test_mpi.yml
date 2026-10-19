@@ -279,6 +279,8 @@ jobs:
             mpi-install: 'openmpi-bin openmpi-common libopenmpi-dev'
             hdf5-install: ''
             hdf5-restart-support: FALSE
+            python-version: '3.12'
+            numpy-version: '2.1'
           - os: 'ubuntu-24.04'
             compiler-type: 'GNU'
             mpi-type: 'MPICH'
@@ -424,6 +426,8 @@ jobs:
             mpi-install: 'open-mpi'
             hdf5-install: 'hdf5'
             hdf5-restart-support: TRUE
+            python-version: '3.13'
+            numpy-version: '2.2'
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.os }} - ${{ matrix.mpi-type }} - CMake - ${{ matrix.compiler-type }} - ${{ matrix.compiler-version }}
     steps:
@@ -605,6 +609,38 @@ jobs:
           fi
           cd install
           ./runtest --mpi --full
+      - name: 'Set up Python for pyquick'
+        if: matrix.python-version
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 'Install numpy, mpi4py and pytest for pyquick'
+        if: matrix.python-version
+        run: |
+          python3 -m pip install "numpy==${{ matrix.numpy-version }}.*" meson ninja pytest
+          # mpi4py must use the same MPI library as libquick_mpi, so build it from source
+          MPICC=$(which mpicc) python3 -m pip install --no-binary=mpi4py mpi4py
+      - name: 'Build and install pyquick Python extension (MPI)'
+        if: matrix.python-version
+        run: |
+          cd build
+          cmake .. -DPYTHON=TRUE -DPython3_EXECUTABLE=$(which python3)
+          cmake --build . --parallel 2 --target pyquick
+          cmake --install .
+      - name: 'Run pyquick MPI tests Using 2 MPI Processes'
+        if: matrix.python-version
+        run: |
+          export PYTHONPATH=$PWD/install/lib${PYTHONPATH:+:$PYTHONPATH}
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            export DYLD_LIBRARY_PATH=$PWD/install/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}
+          fi
+          # runners have 3-4 cores; the launcher tests also use 3 and 4 ranks
+          export PYQUICK_MPIEXEC="mpiexec --oversubscribe"
+          cd src/pyquick/test
+          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py pyquick_ene_H2O_rhf_sto3g.py
+          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py -m pytest test_pyquick_api.py -q -p no:cacheprovider
+          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py -m pytest test_pyquick_mpi.py -q -p no:cacheprovider
+          python3 -m pytest test_pyquick_mpi_launch.py -q -p no:cacheprovider
       - name: 'Upload Test Artifacts for MPI Version'
         if: always()
         uses: actions/upload-artifact@v4

@@ -91,7 +91,8 @@ execute_process(
 set(_PYQUICK_SO "${CMAKE_CURRENT_BINARY_DIR}/_pyquick${PYTHON_EXT_SUFFIX}")
 
 # ---------------------------------------------------------------------------
-# 4. Select the libquick flavour to bind against: serial (CPU) or GPU.
+# 4. Select the libquick flavour to bind against: GPU, MPI (CPU) or serial
+#    (CPU), in that order of precedence.
 #
 #    pyquick.f90 carries GPU code inside #if defined(GPU) guards (mirroring
 #    main.f90). The GPU macro is what src/CMakeLists.txt defines on
@@ -137,6 +138,47 @@ if(CUDA)
     endif()
 
     message(STATUS "pyquick: binding against GPU libquick (${_PYQUICK_LIBNAME})")
+    if(MPI)
+        message(STATUS "pyquick: MPI + GPU is not supported yet; the extension "
+                       "uses a single GPU (MPI is ignored for pyquick)")
+    endif()
+elseif(MPI)
+    # MPI (CPU): bind libquick_mpi, whose MPIV code path QUICK runs across all
+    # ranks of MPI_COMM_WORLD. pyquick.f90's own MPI blocks sit behind
+    # #ifdef MPIV and call MPI directly (use mpi), so the compile also needs
+    # the MPI Fortran module directory and the link the MPI Fortran libraries.
+    # Python owns MPI through mpi4py (see __init__.py), so mpi4py must be
+    # importable -- and built against this same MPI library.
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import mpi4py"
+        RESULT_VARIABLE _mpi4py_result
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _mpi4py_result EQUAL 0)
+        message(FATAL_ERROR
+            "pyquick with MPI=TRUE requires mpi4py for ${Python3_EXECUTABLE}, built "
+            "against the same MPI library as QUICK. Install it from source:\n"
+            "    MPICC=<path to mpicc> ${Python3_EXECUTABLE} -m pip install --no-binary=mpi4py mpi4py\n"
+            "or reconfigure with -DPYTHON=FALSE.")
+    endif()
+
+    set(_PYQUICK_LIBTARGET libquick_mpi)
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/mpi")
+    set(_PYQUICK_LIBNAME "quick_mpi")
+    string(APPEND _PYQUICK_F90FLAGS " -DMPIV")
+
+    # FindMPI gives full library paths; f2py's meson backend wants -L/-l.
+    foreach(_mpiinc ${MPI_Fortran_INCLUDE_DIRS} ${MPI_Fortran_MODULE_DIR})
+        list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-I${_mpiinc}")
+    endforeach()
+    foreach(_mpilib ${MPI_Fortran_LIBRARIES})
+        get_filename_component(_mpilibdir "${_mpilib}" DIRECTORY)
+        get_filename_component(_mpilibname "${_mpilib}" NAME_WE)
+        string(REGEX REPLACE "^lib" "" _mpilibname "${_mpilibname}")
+        list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
+    endforeach()
+    list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
+
+    message(STATUS "pyquick: binding against MPI libquick (${_PYQUICK_LIBNAME})")
 else()
     set(_PYQUICK_LIBTARGET libquick)
     set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/serial")
