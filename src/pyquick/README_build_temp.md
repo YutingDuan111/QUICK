@@ -11,10 +11,11 @@ Python code afterward, only which install you `source` before `import pyquick`.
 - Python 3.10+ **with development headers**. A venv from a headerless system Python will not
   work (meson fails with "Python dependency not found") — use an interpreter that ships its own
   headers + pkg-config: conda/miniforge, pyenv, or a system `python3-dev`/`python3-devel` package.
-- For that same Python: `numpy >= 1.26` (older versions lack f2py's `--backend meson`), `meson`,
-  `ninja`:
+- For that same Python: `numpy >= 2.0`, `meson`, `ninja`. numpy 1.26's f2py silently drops
+  `--f90flags`, so the `#if defined(GPU)` guards are never preprocessed and the extension fails
+  to import (configure now stops with an error on numpy < 2.0):
   ```bash
-  python3 -m pip install "numpy>=1.26" meson ninja
+  python3 -m pip install "numpy>=2.0" meson ninja
   ```
 - GPU only: **NVIDIA** — CUDA Toolkit + a GNU/Clang version in the compatibility table in
   `quick-cmake/QUICKCudaConfig.cmake`. **AMD** — ROCm + `hipcc`.

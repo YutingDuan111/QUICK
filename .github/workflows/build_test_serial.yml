@@ -188,7 +188,7 @@ jobs:
             hdf5-install: 'libhdf5-dev'
             hdf5-restart-support: TRUE
             python-version: '3.10'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-22.04'
             compiler-type: 'GNU'
             compiler-version: '11'
@@ -199,7 +199,7 @@ jobs:
             hdf5-install: 'libhdf5-dev'
             hdf5-restart-support: TRUE
             python-version: '3.11'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-24.04'
             compiler-type: 'GNU'
             compiler-version: '12'
@@ -243,7 +243,7 @@ jobs:
             hdf5-install: ''
             hdf5-restart-support: FALSE
             python-version: '3.11'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-24.04'
             compiler-type: 'CLANG'
             compiler-version: '18'
