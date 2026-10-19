@@ -23,7 +23,7 @@ calc = pyquick.PyQuick(
     method='HF',
     basis='STO-3G',
     properties=['mulliken_charges', 'lowdin_charges'],
-    keywords={'cutoff': '1.0e-9', 'denserms': '1.0e-6'},
+    keywords={'cutoff': '1.0e-9', 'denserms': '1.0e-6', 'SCF': 300},
 )
 result = calc.get_energy('''
     O  -0.33840   0.00380   0.23923
