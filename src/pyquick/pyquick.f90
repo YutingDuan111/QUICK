@@ -37,6 +37,7 @@ module pyquick
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
               job_get_gradients, job_get_geometry, job_exception_message, &
               job_has_esp, job_get_esp_charges, &
+              job_has_beta, job_get_beta_mo_energies, job_get_beta_density_matrix, &
               job_has_optimized, job_opt_converged, job_get_optimized_geometry
 
     integer, parameter :: KEYWORD_LEN = 300
@@ -107,6 +108,7 @@ module pyquick
     logical :: job_has_lowdin        = .false.
     logical :: job_has_mo_energies   = .false.
     logical :: job_has_density_matrix = .false.
+    logical :: job_has_beta           = .false.   ! unrestricted run: Eb / denseb hold beta
 
     type :: method_entry
         character(len=:), allocatable :: keyword
@@ -962,6 +964,10 @@ contains
         job_has_lowdin         = quick_method%dipole
         job_has_mo_energies    = allocated(quick_qm_struct%E)
         job_has_density_matrix = allocated(quick_qm_struct%dense)
+        ! gate on unrst, not on allocation: QUICK allocates denseb for closed-shell
+        ! DFT too, and arrays can outlive the run that filled them
+        job_has_beta           = quick_method%unrst .and. allocated(quick_qm_struct%Eb) &
+                                 .and. allocated(quick_qm_struct%denseb)
         job_has_gradient       = did_gradient .and. allocated(quick_qm_struct%gradient)
 
         job_has_optimized = quick_method%opt
@@ -1067,7 +1073,8 @@ contains
     end subroutine job_get_mo_energies
 
     subroutine job_get_density_matrix(dm, nr, nc)
-        ! Returns the alpha density matrix as a 1D (row-major) array of length
+        ! Returns QUICK's dense -- the TOTAL density on restricted runs, the ALPHA
+        ! density on unrestricted ones -- as a 1D (row-major) array of length
         ! nr*nc = nbasis*nbasis.  Reshape in Python: dm.reshape(nr, nc).
         ! We cap at 3000*3000 = 9_000_000 elements; large basis sets are rare.
         !f2py intent(out) dm, nr, nc
@@ -1090,6 +1097,44 @@ contains
             end do
         end do
     end subroutine job_get_density_matrix
+
+    subroutine job_get_beta_mo_energies(energies, n)
+        ! Beta MO energies (unrestricted runs only); see job_get_mo_energies.
+        !f2py intent(out) energies, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: energies(10000)
+        energies = 0.0d0
+        n = 0
+        if (.not. job_has_beta) then
+            call fail("'beta_mo_energies' exist only for unrestricted (open-shell) runs")
+            return
+        end if
+        n = NBSuse
+        energies(1:NBSuse) = quick_qm_struct%Eb(1:NBSuse)
+    end subroutine job_get_beta_mo_energies
+
+    subroutine job_get_beta_density_matrix(dm, nr, nc)
+        ! Beta density matrix (unrestricted runs only), row-major like
+        ! job_get_density_matrix.
+        !f2py intent(out) dm, nr, nc
+        integer, intent(out) :: nr, nc
+        double precision, intent(out) :: dm(9000000)
+        integer :: i, j
+        dm = 0.0d0
+        nr = 0
+        nc = 0
+        if (.not. job_has_beta) then
+            call fail("'beta_density_matrix' exists only for unrestricted (open-shell) runs")
+            return
+        end if
+        nr = nbasis
+        nc = nbasis
+        do j = 1, nbasis
+            do i = 1, nbasis
+                dm((i - 1) * nbasis + j) = quick_qm_struct%denseb(i, j)
+            end do
+        end do
+    end subroutine job_get_beta_density_matrix
 
     subroutine job_get_gradients(g, n)
         ! Returns the nuclear gradient as a flat, row-major (per-atom) array of

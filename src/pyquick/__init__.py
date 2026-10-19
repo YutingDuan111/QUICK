@@ -273,6 +273,11 @@ class _PyQuickEngine:
         if _mod.job_has_density_matrix:
             r, nr, nc = _mod.job_get_density_matrix()
             self._results['density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
+        if _mod.job_has_beta:
+            r, n = _mod.job_get_beta_mo_energies()
+            self._results['beta_mo_energies'] = r[:n].copy()
+            r, nr, nc = _mod.job_get_beta_density_matrix()
+            self._results['beta_density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
         if _mod.job_has_dipole:
             self._results['dipole'] = _mod.job_dipole.copy()   # (3,) Debye
         if _mod.job_has_gradient:
@@ -438,7 +443,11 @@ class _PyQuickEngine:
 
     @property
     def density_matrix(self):
-        """Alpha density matrix as a numpy array of shape (nbasis, nbasis)."""
+        """Density matrix, numpy array of shape (nbasis, nbasis).
+
+        The TOTAL density on restricted runs; the ALPHA density on unrestricted
+        (open-shell) runs, where :attr:`beta_density_matrix` holds the beta part.
+        """
         self._require_run('density_matrix')
         if 'density_matrix' not in self._results:
             raise AttributeError(
@@ -535,7 +544,9 @@ _SUPPORTED_PROPERTIES = {
 # compatibility, but they are a no-op there — you get them either way.
 _ALWAYS_ON_PROPERTIES = {
     'mo_energies',       # alpha MO energies
-    'density_matrix',    # alpha density matrix
+    'density_matrix',    # total (restricted) or alpha (unrestricted) density
+    'beta_mo_energies',      # unrestricted runs only
+    'beta_density_matrix',   # unrestricted runs only
 }
 
 # These are all computed inside QUICK's `dipole` routine, which only runs when
@@ -549,8 +560,6 @@ _JOBTYPE_WORDS = {'energy', 'gradient', 'gradients', 'forces',
 # Extras planned for later phases — reported with a clearer message than
 # "unknown property" so callers know they exist but aren't wired up yet.
 _DEFERRED_PROPERTIES = {
-    'beta_mo_energies': 'Phase 3',
-    'beta_density_matrix': 'Phase 3',
     'mp2': 'Phase 3',
     'e_mp2': 'Phase 3',
 }
@@ -908,6 +917,7 @@ class Result:
         values['atomic_numbers'] = job._results['atomic_numbers']
         values['coordinates'] = job._results['coordinates']
         for key in ('mulliken', 'lowdin', 'esp_charges', 'mo_energies', 'density_matrix',
+                    'beta_mo_energies', 'beta_density_matrix',
                     'dipole', 'gradient', 'optimized_coordinates', 'converged'):
             if key in job._results:
                 values[key] = job._results[key]
@@ -1003,17 +1013,47 @@ class Result:
     # -- always available (every SCF computes them) --------------------------
     @property
     def mo_energies(self):
-        """Alpha molecular orbital energies, numpy array of shape (NBSuse,)."""
+        """Molecular orbital energies, numpy array of shape (NBSuse,).
+
+        The alpha orbitals on unrestricted (open-shell) runs; see
+        :attr:`beta_mo_energies` for the beta ones.
+        """
         if 'mo_energies' not in self._values:
             raise AttributeError("'mo_energies' was not computed for this run")
         return self._values['mo_energies']
 
     @property
     def density_matrix(self):
-        """Alpha density matrix, numpy array of shape (nbasis, nbasis)."""
+        """Density matrix, numpy array of shape (nbasis, nbasis).
+
+        The TOTAL density on restricted runs (RHF, closed-shell DFT); the ALPHA
+        density on unrestricted (open-shell) runs, where
+        :attr:`beta_density_matrix` holds the beta part (total = alpha + beta).
+        """
         if 'density_matrix' not in self._values:
             raise AttributeError("'density_matrix' was not computed for this run")
         return self._values['density_matrix']
+
+    @property
+    def beta_mo_energies(self):
+        """Beta molecular orbital energies, numpy array of shape (NBSuse,).
+
+        Unrestricted (open-shell) runs only.
+        """
+        if 'beta_mo_energies' not in self._values:
+            raise AttributeError("'beta_mo_energies' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+        return self._values['beta_mo_energies']
+
+    @property
+    def beta_density_matrix(self):
+        """Beta density matrix, numpy array of shape (nbasis, nbasis).
+
+        Unrestricted (open-shell) runs only; :attr:`density_matrix` is then
+        the alpha density.
+        """
+        if 'beta_density_matrix' not in self._values:
+            raise AttributeError("'beta_density_matrix' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+        return self._values['beta_density_matrix']
 
     # -- opt-in arrays (need the DIPOLE keyword) -----------------------------
     @property

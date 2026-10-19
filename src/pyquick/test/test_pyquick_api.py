@@ -15,6 +15,8 @@ Job type is chosen by which method you call:
 import math
 import os
 
+import numpy as np
+
 import pytest
 
 pyquick = pytest.importorskip("pyquick")
@@ -58,7 +60,7 @@ def test_jobtype_as_property_is_rejected():
 
 def test_deferred_property_reports_phase():
     with pytest.raises(ValueError) as excinfo:
-        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['beta_mo_energies'])
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['mp2'])
     assert 'Phase 3' in str(excinfo.value)
 
 
@@ -772,3 +774,99 @@ def test_esp_grid_keyword_rejected():
     """ESP on a user grid needs an external point file; not supported."""
     with pytest.raises(ValueError, match="(?i)esp_grid"):
         pyquick.PyQuick('HF', 'STO-3G', keywords={'ESP_GRID': None})
+
+
+# ---------------------------------------------------------------------------
+# Beta-spin results (unrestricted runs only)
+#
+# References: the quick binary's Molden export (EXPORT=MOLDEN) for UHF H2O+.
+# Beta energies are its "Spin= Beta" Ene= values; the beta density is
+# C_occ C_occ^T from its occupied beta orbitals.  The same construction from
+# the alpha orbitals reproduces pyquick's alpha density_matrix to 1e-10.
+# ---------------------------------------------------------------------------
+
+REF_BETA_MO = [-20.9552272, -1.668309882, -1.076446361, -0.9529687494,
+               -0.1830366227, 0.0233776459, 0.1322832866]
+REF_BETA_DENSITY = [
+    [1.05337889, -0.223302349, 0.03605546, -0.000404959, -0.025497093, -0.017306002, -0.017305041],
+    [-0.223302349, 0.958009545, -0.19500748, 0.002190261, 0.137910639, 0.025217682, 0.025233392],
+    [0.03605546, -0.19500748, 0.64242467, -0.005434358, -0.11795243, 0.020053875, 0.317555271],
+    [-0.000404959, 0.002190261, -0.005434358, 6.1032e-05, 0.00384269, -0.001895839, -0.001895679],
+    [-0.025497093, 0.137910639, -0.11795243, 0.00384269, 0.558997416, -0.329724142, 0.09101373],
+    [-0.017306002, 0.025217682, 0.020053875, -0.001895839, -0.329724142, 0.20840851, -0.070739926],
+    [-0.017305041, 0.025233392, 0.317555271, -0.001895679, 0.09101373, -0.070739926, 0.208411687],
+]
+
+
+def test_beta_mo_energies_open_shell_match_binary():
+    r = _run('HF', charge=1, mult=2)
+    assert r.beta_mo_energies.shape == (7,)
+    assert list(r.beta_mo_energies) == pytest.approx(REF_BETA_MO, abs=1e-6)
+
+
+def test_beta_density_open_shell_match_binary():
+    r = _run('HF', charge=1, mult=2)
+    assert r.beta_density_matrix.shape == (7, 7)
+    for got, ref in zip(r.beta_density_matrix, REF_BETA_DENSITY):
+        assert list(got) == pytest.approx(ref, abs=1e-6)
+
+
+def test_beta_differs_from_alpha_open_shell():
+    """A doublet has one more alpha than beta electron, so the spins differ."""
+    for method in ('HF', 'B3LYP'):
+        r = _run(method, charge=1, mult=2)
+        assert r.beta_mo_energies.shape == r.mo_energies.shape
+        assert r.beta_density_matrix.shape == r.density_matrix.shape
+        assert not np.allclose(r.beta_mo_energies, r.mo_energies, atol=1e-4)
+        assert not np.allclose(r.beta_density_matrix, r.density_matrix, atol=1e-4)
+
+
+def test_uhf_closed_shell_beta_equals_alpha():
+    """UHF on closed-shell water: beta must equal alpha (density_matrix is the
+    alpha density on unrestricted runs)."""
+    r = _run('UHF')
+    assert np.allclose(r.beta_mo_energies, r.mo_energies, atol=1e-7)
+    assert np.allclose(r.beta_density_matrix, r.density_matrix, atol=1e-7)
+
+
+@pytest.mark.parametrize("method", ['HF', 'B3LYP'])
+def test_beta_unavailable_for_restricted(method):
+    """Restricted runs have no separate beta set (QUICK allocates a beta density
+    for closed-shell DFT too, so this must not depend on allocation)."""
+    r = _run(method)
+    with pytest.raises(AttributeError, match="unrestricted"):
+        _ = r.beta_mo_energies
+    with pytest.raises(AttributeError, match="unrestricted"):
+        _ = r.beta_density_matrix
+
+
+def test_beta_not_carried_into_restricted_run():
+    _run('HF', charge=1, mult=2)
+    r = _run('HF')
+    with pytest.raises(AttributeError, match="unrestricted"):
+        _ = r.beta_density_matrix
+
+
+def test_beta_in_persistent_job():
+    calc = pyquick.PyQuick('HF', 'STO-3G', charge=1, mult=2, keywords=LOOSE, log=False)
+    with calc.new_job(WATER) as job:
+        r = job.run(WATER)
+    assert list(r.beta_mo_energies) == pytest.approx(REF_BETA_MO, abs=1e-6)
+
+
+def test_beta_properties_accepted_as_noop():
+    """beta_* are always returned on unrestricted runs; naming them in
+    properties is accepted (like mo_energies / density_matrix)."""
+    calc = pyquick.PyQuick('HF', 'STO-3G', charge=1, mult=2,
+                           properties=['beta_mo_energies', 'beta_density_matrix'])
+    assert calc.properties == {'beta_mo_energies', 'beta_density_matrix'}
+
+
+def test_density_matrix_meaning_documented():
+    """density_matrix is the TOTAL density on restricted runs and the ALPHA
+    density on unrestricted runs; the docstring must say so."""
+    rhf = _run('HF')
+    uhf = _run('UHF')
+    assert np.allclose(rhf.density_matrix, 2 * uhf.density_matrix, atol=1e-7)
+    doc = pyquick.Result.density_matrix.__doc__.lower()
+    assert 'total' in doc and 'alpha' in doc and 'unrestricted' in doc
