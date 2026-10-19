@@ -1,5 +1,5 @@
 """
-Smoke test for the pyquick Python interface (Calculation/Result API).
+Smoke test for the pyquick Python interface (PyQuick/Result API).
 
 Runs an HF/STO-3G energy calculation on water using the same geometry and
 cutoff settings as the reference test ene_H2O_rhf_sto3g, then checks that
@@ -19,7 +19,7 @@ except ImportError as e:
 REF_ENERGY = -74.947863811   # HF/STO-3G total energy for H2O (Ha)
 TOL        =   4.0e-5        # standard check_energy threshold from runtest
 
-calc = pyquick.Calculation(
+calc = pyquick.PyQuick(
     method='HF',
     basis='STO-3G',
     properties=['mulliken_charges', 'lowdin_charges'],
