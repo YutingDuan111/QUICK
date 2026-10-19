@@ -15,3 +15,6 @@ debug.*
 *~
 *.bak
 make.in
+.pytest_cache/
+__pycache__/
+*.py[cod]

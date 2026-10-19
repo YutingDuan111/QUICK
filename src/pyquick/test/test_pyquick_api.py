@@ -1,5 +1,5 @@
 """
-pytest unit + integration tests for the pyquick Calculation/Result API.
+pytest unit + integration tests for the pyquick PyQuick/Result API.
 
 Pure-Python tests (validation, method resolution, input assembly) need only that
 the compiled extension imports.  The integration tests additionally run a small
@@ -34,17 +34,17 @@ TOL = 4.0e-5
 
 def test_missing_basis_raises():
     with pytest.raises(ValueError):
-        pyquick.Calculation(method='HF', basis='')
+        pyquick.PyQuick(method='HF', basis='')
 
 
 def test_unknown_property_raises():
     with pytest.raises(ValueError):
-        pyquick.Calculation(method='HF', basis='STO-3G', properties=['bogus'])
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['bogus'])
 
 
 def test_properties_default_empty():
     """No properties needed for an energy run; energy is always returned."""
-    calc = pyquick.Calculation(method='HF', basis='STO-3G')
+    calc = pyquick.PyQuick(method='HF', basis='STO-3G')
     assert calc.properties == set()
 
 
@@ -52,17 +52,17 @@ def test_jobtype_as_property_is_rejected():
     """energy/gradient/optimize are methods now, so they are not valid property values."""
     for bad in ('energy', 'gradient', 'forces', 'optimize', 'optimized_coords'):
         with pytest.raises(ValueError):
-            pyquick.Calculation(method='HF', basis='STO-3G', properties=[bad])
+            pyquick.PyQuick(method='HF', basis='STO-3G', properties=[bad])
 
 
 def test_deferred_property_reports_phase():
     with pytest.raises(ValueError) as excinfo:
-        pyquick.Calculation(method='HF', basis='STO-3G', properties=['esp_charges'])
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['esp_charges'])
     assert 'Phase 4' in str(excinfo.value)
 
 
 def test_dipole_is_a_supported_property():
-    calc = pyquick.Calculation(method='HF', basis='STO-3G', properties=['dipole'])
+    calc = pyquick.PyQuick(method='HF', basis='STO-3G', properties=['dipole'])
     assert 'dipole' in calc.properties
 
 
@@ -90,7 +90,7 @@ def test_resolve_method_bad_mult():
 
 
 def test_input_string_contains_tokens():
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='B3LYP', basis='6-31G*',
         properties=['mulliken_charges'],
         charge=-1, mult=2, keywords={'cutoff': '1e-9'})
@@ -109,7 +109,7 @@ def test_input_string_contains_tokens():
 # ---------------------------------------------------------------------------
 
 def test_geo_opt_optimizes_water():
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G',
         keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
     r = calc.geo_opt(WATER)
@@ -127,7 +127,7 @@ def test_geo_opt_optimizes_water():
 # ---------------------------------------------------------------------------
 
 def _energy(properties=()):
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G', properties=properties,
         keywords={'cutoff': '1.0e-9', 'denserms': '1.0e-6'})
     return calc.get_energy(WATER)
@@ -222,7 +222,7 @@ def test_dipole_not_requested_raises():
 # ---------------------------------------------------------------------------
 
 def _grad(properties=()):
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G', properties=properties,
         keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
     return calc.get_grad(WATER)
@@ -256,7 +256,7 @@ def test_gradient_matches_finite_difference():
         moved = [row[:] for row in atoms]
         moved[atom][1 + comp] = f"{float(moved[atom][1 + comp]) + delta:.6f}"
         geom = "\n".join(" ".join(row) for row in moved)
-        calc = pyquick.Calculation(
+        calc = pyquick.PyQuick(
             method='HF', basis='STO-3G',
             keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
         return calc.get_energy(geom).total_energy
