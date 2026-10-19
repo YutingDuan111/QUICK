@@ -17,12 +17,15 @@ module pyquick
     use quick_grad_oshell_module, only : oshell_gradient
     use quick_optimizer_module, only : lopt
     use quick_exception_module, only : get_exception_message
+    use quick_molsurface_module, only : generate_MKS_surfaces
+    use quick_oeproperties_module, only : compute_esp, compute_ESP_charge, esp_charges
 
     implicit none
 
     private
     public :: set_calc, set_basis, set_method, clear_methods, read_geom, &
               had_error, error_message, print_input, input_string, &
+              set_point_charges, clear_point_charges, &
               job_run, job_destroy, job_set_output, &
               job_open, job_step, job_close, &
               job_active, &
@@ -33,6 +36,8 @@ module pyquick
               job_has_mulliken, job_has_lowdin, job_has_mo_energies, job_has_density_matrix, &
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
               job_get_gradients, job_get_geometry, job_exception_message, &
+              job_has_esp, job_get_esp_charges, &
+              job_has_beta, job_get_beta_mo_energies, job_get_beta_density_matrix, &
               job_has_optimized, job_opt_converged, job_get_optimized_geometry
 
     integer, parameter :: KEYWORD_LEN = 300
@@ -54,6 +59,11 @@ module pyquick
 
     ! atom count stored by read_geom so job_run knows natom before alloc
     integer :: geom_natom = 0
+
+    ! external point charges for the following runs, set from Python:
+    ! pc_data(1:3,i) = Angstrom coordinates, pc_data(4,i) = charge
+    integer :: pc_n = 0
+    double precision, allocatable :: pc_data(:,:)
 
     ! output file stem (default 'pyquick_job')
     character(len=80) :: output_stem = 'pyquick_job'
@@ -94,9 +104,11 @@ module pyquick
 
     ! availability flags for array results
     logical :: job_has_mulliken      = .false.
+    logical :: job_has_esp           = .false.
     logical :: job_has_lowdin        = .false.
     logical :: job_has_mo_energies   = .false.
     logical :: job_has_density_matrix = .false.
+    logical :: job_has_beta           = .false.   ! unrestricted run: Eb / denseb hold beta
 
     type :: method_entry
         character(len=:), allocatable :: keyword
@@ -515,12 +527,14 @@ contains
 
         ! set natom (module-level target) BEFORE alloc uses it
         natom = geom_natom
+        call prepare_point_charges()
 
         call alloc(quick_molspec, .false., ierr)
         if (ierr /= 0) then
             call fail('job_run: alloc(quick_molspec) failed')
             return
         end if
+        call inject_point_charges()
 
         ! --- inject geometry into QUICK module-level state ---
 
@@ -605,6 +619,10 @@ contains
         end if
 #endif
 
+        ! QUICK sets Exc only on the DFT path; reset it so an HF run after a DFT
+        ! run in the same process does not report the previous run's value
+        quick_qm_struct%Exc = 0.0d0
+
         ! --- energy, gradient, or optimization ---
         ! quick_method%opt/%grad come from the OPTIMIZE/GRADIENT keywords appended
         ! above. Each branch runs its own SCF, so getEnergy is only called for a
@@ -646,6 +664,9 @@ contains
                 return
             end if
         end if
+
+        ! ESP charges after an energy or gradient job, as main.f90 does
+        if (.not. quick_method%opt) call run_esp_charges()
 
         ! --- post-SCF charges/dipole + harvest all results ---
         call harvest_results(quick_method%grad)
@@ -744,8 +765,10 @@ contains
         if (ierr /= 0) then; call fail('job_open: read_Job_and_Atom failed'); return; end if
 
         natom = geom_natom
+        call prepare_point_charges()
         call alloc(quick_molspec, .false., ierr)
         if (ierr /= 0) then; call fail('job_open: alloc(quick_molspec) failed'); return; end if
+        call inject_point_charges()
 
         ! atom types (deduplicate by atomic number) + initial coordinates
         natm_type = 0
@@ -844,6 +867,8 @@ contains
                             quick_molspec%extchg, ierr)
 #endif
 
+        quick_qm_struct%Exc = 0.0d0   ! see job_run: QUICK sets Exc only for DFT
+
         if (want_gradient /= 0) then
             if (quick_method%unrst) then
                 call oshell_gradient(ierr)
@@ -855,6 +880,7 @@ contains
             call getEnergy(.false., ierr)
             if (ierr /= 0) then; call fail('job_step: getEnergy failed'); return; end if
         end if
+        call run_esp_charges()
 
 #if defined(GPU)
         ! --- GPU: intentionally NOT calling gpu_cleanup() here. ---
@@ -934,9 +960,14 @@ contains
         if (quick_method%dipole) job_dipole = quick_qm_struct%dipole
 
         job_has_mulliken       = quick_method%dipole
+        job_has_esp            = quick_method%esp_charge .and. allocated(esp_charges)
         job_has_lowdin         = quick_method%dipole
         job_has_mo_energies    = allocated(quick_qm_struct%E)
         job_has_density_matrix = allocated(quick_qm_struct%dense)
+        ! gate on unrst, not on allocation: QUICK allocates denseb for closed-shell
+        ! DFT too, and arrays can outlive the run that filled them
+        job_has_beta           = quick_method%unrst .and. allocated(quick_qm_struct%Eb) &
+                                 .and. allocated(quick_qm_struct%denseb)
         job_has_gradient       = did_gradient .and. allocated(quick_qm_struct%gradient)
 
         job_has_optimized = quick_method%opt
@@ -961,6 +992,39 @@ contains
     ! Array result getters
     ! Each checks the availability flag and sets had_error if not computed.
     ! -----------------------------------------------------------------------
+
+    subroutine run_esp_charges()
+        ! ESP-fitted charges (ESP_CHARGE keyword). Calls the steps of QUICK's
+        ! compute_oeprop directly -- surface, ESP on it, charge fit -- but skips
+        ! writing the <stem>.vdw surface file, so log=False leaves nothing on
+        ! disk (quick_open cannot target the null device: it renames an
+        ! existing file with mv first).
+        double precision, allocatable :: esp_on_points(:)
+
+        if (allocated(esp_charges)) deallocate(esp_charges)
+        if (.not. quick_method%esp_charge) return
+
+        call generate_MKS_surfaces()
+        allocate(esp_on_points(quick_molspec%nvdwpoint))
+        call compute_esp(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
+        call compute_ESP_charge(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
+        deallocate(esp_on_points)
+        deallocate(quick_molspec%vdwpointxyz)
+    end subroutine run_esp_charges
+
+    subroutine job_get_esp_charges(charges, n)
+        !f2py intent(out) charges, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: charges(10000)
+        charges = 0.0d0
+        n = 0
+        if (.not. job_has_esp) then
+            call fail("ESP charges were not computed; request properties=['esp_charges']")
+            return
+        end if
+        n = size(esp_charges)
+        charges(1:n) = esp_charges
+    end subroutine job_get_esp_charges
 
     subroutine job_get_mulliken(charges, n)
         ! f2py cannot use external module variables as C array bounds, so we
@@ -1009,7 +1073,8 @@ contains
     end subroutine job_get_mo_energies
 
     subroutine job_get_density_matrix(dm, nr, nc)
-        ! Returns the alpha density matrix as a 1D (row-major) array of length
+        ! Returns QUICK's dense -- the TOTAL density on restricted runs, the ALPHA
+        ! density on unrestricted ones -- as a 1D (row-major) array of length
         ! nr*nc = nbasis*nbasis.  Reshape in Python: dm.reshape(nr, nc).
         ! We cap at 3000*3000 = 9_000_000 elements; large basis sets are rare.
         !f2py intent(out) dm, nr, nc
@@ -1032,6 +1097,44 @@ contains
             end do
         end do
     end subroutine job_get_density_matrix
+
+    subroutine job_get_beta_mo_energies(energies, n)
+        ! Beta MO energies (unrestricted runs only); see job_get_mo_energies.
+        !f2py intent(out) energies, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: energies(10000)
+        energies = 0.0d0
+        n = 0
+        if (.not. job_has_beta) then
+            call fail("'beta_mo_energies' exist only for unrestricted (open-shell) runs")
+            return
+        end if
+        n = NBSuse
+        energies(1:NBSuse) = quick_qm_struct%Eb(1:NBSuse)
+    end subroutine job_get_beta_mo_energies
+
+    subroutine job_get_beta_density_matrix(dm, nr, nc)
+        ! Beta density matrix (unrestricted runs only), row-major like
+        ! job_get_density_matrix.
+        !f2py intent(out) dm, nr, nc
+        integer, intent(out) :: nr, nc
+        double precision, intent(out) :: dm(9000000)
+        integer :: i, j
+        dm = 0.0d0
+        nr = 0
+        nc = 0
+        if (.not. job_has_beta) then
+            call fail("'beta_density_matrix' exists only for unrestricted (open-shell) runs")
+            return
+        end if
+        nr = nbasis
+        nc = nbasis
+        do j = 1, nbasis
+            do i = 1, nbasis
+                dm((i - 1) * nbasis + j) = quick_qm_struct%denseb(i, j)
+            end do
+        end do
+    end subroutine job_get_beta_density_matrix
 
     subroutine job_get_gradients(g, n)
         ! Returns the nuclear gradient as a flat, row-major (per-atom) array of
@@ -1106,6 +1209,44 @@ contains
     ! Private helpers
     ! -----------------------------------------------------------------------
 
+    subroutine set_point_charges(charges, n)
+        ! Set the external point charges for the following runs (replaces any
+        ! previous set): charges(1:3,i) in Angstrom, charges(4,i) the charge.
+        integer, intent(in) :: n
+        double precision, intent(in) :: charges(4, n)
+
+        if (allocated(pc_data)) deallocate(pc_data)
+        allocate(pc_data(4, n))
+        pc_data = charges
+        pc_n = n
+    end subroutine set_point_charges
+
+    subroutine clear_point_charges()
+        if (allocated(pc_data)) deallocate(pc_data)
+        pc_n = 0
+    end subroutine clear_point_charges
+
+    subroutine prepare_point_charges()
+        ! Before alloc(quick_molspec), which sizes extxyz/extchg from nextatom.
+        ! initialize1 resets nextatom to 0 and isTemplate skips QUICK's own
+        ! reading of the charges, so pyquick sets the count itself. Drop any
+        ! arrays left from an earlier run so alloc sizes them for this one.
+        if (allocated(quick_molspec%extxyz)) deallocate(quick_molspec%extxyz)
+        if (allocated(quick_molspec%extchg)) deallocate(quick_molspec%extchg)
+        quick_molspec%nextatom = pc_n
+    end subroutine prepare_point_charges
+
+    subroutine inject_point_charges()
+        ! After alloc(quick_molspec): copy the charges in (Angstrom -> Bohr),
+        ! as set_quick_molspecs in quick_api_module does for the AMBER API.
+        integer :: i
+
+        do i = 1, pc_n
+            quick_molspec%extxyz(1:3, i) = pc_data(1:3, i) * A_TO_BOHRS
+            quick_molspec%extchg(i)      = pc_data(4, i)
+        end do
+    end subroutine inject_point_charges
+
     function build_keyword_line() result(text)
         character(len=:), allocatable :: text
         integer :: i
@@ -1124,6 +1265,10 @@ contains
         end if
 
         if (has_basis) text = trim(text) // ' ' // trim(basis_token)
+
+        ! EXTCHARGES makes QUICK report ECharge; the charges themselves are
+        ! injected by prepare_/inject_point_charges, not read from an input file
+        if (pc_n > 0) text = trim(text) // ' EXTCHARGES'
 
     end function build_keyword_line
 

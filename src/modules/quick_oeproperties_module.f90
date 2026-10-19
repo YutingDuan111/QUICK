@@ -17,7 +17,11 @@
 !---------------------------------------------------------------------!
 module quick_oeproperties_module
  private
- public :: compute_oeprop
+ public :: compute_oeprop, compute_esp, compute_ESP_charge, esp_charges
+
+ ! ESP-fitted atomic charges from the last compute_ESP_charge call (length natom);
+ ! kept so API callers (e.g. pyquick) can read them, not only the printed table
+ double precision, allocatable :: esp_charges(:)
 
  contains
 
@@ -397,6 +401,10 @@ module quick_oeproperties_module
    call DGEMV('N', natom+1, natom+1, One, A, LDA, B, 1, Zero, q, 1)
 
 !  B is copied to charge array.
+
+   if (allocated(esp_charges)) deallocate(esp_charges)
+   allocate(esp_charges(natom))
+   esp_charges = q(1:natom)
 
    Net_charge = Zero
 

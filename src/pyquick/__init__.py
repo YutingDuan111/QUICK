@@ -1,5 +1,7 @@
 import copy as _copy
 
+import numpy as _np
+
 try:
     from ._pyquick import pyquick as _mod
 except ImportError as e:
@@ -51,6 +53,7 @@ class _PyQuickEngine:
         self._basis   = None   # str, e.g. 'STO-3G'
         self._methods = []     # list of (keyword_str, arg_str_or_None)
         self._geom    = None   # raw geometry string as passed by user
+        self._point_charges = None   # (n, 4) array of x, y, z (Angstrom), q; or None
         self._ran     = False
         self._results = {}     # snapshot of results captured at end of run()
 
@@ -119,6 +122,20 @@ class _PyQuickEngine:
         _checked(_mod.read_geom)(geom)
         self._geom = geom
 
+    def set_point_charges(self, charges):
+        """Set external point charges for the following runs, or clear them.
+
+        *charges* is an ``(n, 4)`` float array of ``x, y, z`` (Angstrom) and
+        charge, as returned by :func:`_check_point_charges`; ``None`` clears.
+        """
+        self._point_charges = None if charges is None else charges.copy()
+
+    def _replay_point_charges(self):
+        if self._point_charges is None:
+            _mod.clear_point_charges()
+        else:
+            _checked(_mod.set_point_charges)(self._point_charges.T)
+
     def print_input(self):
         """Print the assembled QUICK input to stdout."""
         print(self.input_string)
@@ -176,6 +193,7 @@ class _PyQuickEngine:
             else:
                 _checked(_mod.set_method)(keyword)
         _checked(_mod.read_geom)(self._geom)
+        self._replay_point_charges()
         _checked(_mod.job_run)(jobtype, 1 if log else 0, int(max_cycles))
         self._ran = True
         self._snapshot()
@@ -190,6 +208,7 @@ class _PyQuickEngine:
                 _checked(_mod.set_method)(keyword, arg)
             else:
                 _checked(_mod.set_method)(keyword)
+        self._replay_point_charges()
 
     def job_open(self, log=True):
         """Set up a persistent job (allocate once) on the current setup."""
@@ -242,6 +261,9 @@ class _PyQuickEngine:
         if _mod.job_has_mulliken:
             r, n = _mod.job_get_mulliken()
             self._results['mulliken'] = r[:n].copy()
+        if _mod.job_has_esp:
+            r, n = _mod.job_get_esp_charges()
+            self._results['esp_charges'] = r[:n].copy()
         if _mod.job_has_lowdin:
             r, n = _mod.job_get_lowdin()
             self._results['lowdin'] = r[:n].copy()
@@ -251,6 +273,11 @@ class _PyQuickEngine:
         if _mod.job_has_density_matrix:
             r, nr, nc = _mod.job_get_density_matrix()
             self._results['density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
+        if _mod.job_has_beta:
+            r, n = _mod.job_get_beta_mo_energies()
+            self._results['beta_mo_energies'] = r[:n].copy()
+            r, nr, nc = _mod.job_get_beta_density_matrix()
+            self._results['beta_density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
         if _mod.job_has_dipole:
             self._results['dipole'] = _mod.job_dipole.copy()   # (3,) Debye
         if _mod.job_has_gradient:
@@ -273,6 +300,8 @@ class _PyQuickEngine:
         new._basis   = self._basis
         new._methods = list(self._methods)   # list of immutable tuples — shallow copy is sufficient
         new._geom    = self._geom
+        new._point_charges = (None if self._point_charges is None
+                              else self._point_charges.copy())
         return new
 
     def __copy__(self):
@@ -355,16 +384,16 @@ class _PyQuickEngine:
 
     @property
     def e_external_charge(self):
-        """QM <-> external point-charge interaction energy in Hartree.
+        """Repulsion among the external point charges themselves, in Hartree.
 
-        Only available when EXTCHARGES was set. This term is reported
+        Only available when point charges were set. This term is reported
         separately and is never part of ``total_energy``.
         """
         self._require_run('e_external_charge')
         if 'e_external_charge' not in self._results:
             raise AttributeError(
-                "'e_external_charge' is unavailable: EXTCHARGES was not set "
-                "for this job — enable it via set_method('EXTCHARGES')"
+                "'e_external_charge' is unavailable: no point charges were set "
+                "for this job — set them via set_point_charges()"
             )
         return self._results['e_external_charge']
 
@@ -414,7 +443,11 @@ class _PyQuickEngine:
 
     @property
     def density_matrix(self):
-        """Alpha density matrix as a numpy array of shape (nbasis, nbasis)."""
+        """Density matrix, numpy array of shape (nbasis, nbasis).
+
+        The TOTAL density on restricted runs; the ALPHA density on unrestricted
+        (open-shell) runs, where :attr:`beta_density_matrix` holds the beta part.
+        """
         self._require_run('density_matrix')
         if 'density_matrix' not in self._results:
             raise AttributeError(
@@ -470,6 +503,27 @@ def _count_atoms(geometry):
     """
     return sum(1 for line in str(geometry).splitlines() if len(line.split()) >= 4)
 
+
+def _check_point_charges(point_charges):
+    """Validate *point_charges*; return an ``(n, 4)`` float array, or None.
+
+    Each row is ``(x, y, z, q)`` with coordinates in Angstrom.  ``None`` means
+    no charges; an empty list is rejected rather than read as "no charges".
+    """
+    if point_charges is None:
+        return None
+    try:
+        arr = _np.array(point_charges, dtype=float)
+    except (TypeError, ValueError):
+        raise ValueError("point_charges must be numeric rows of (x, y, z, q)") from None
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise ValueError(
+            f"point_charges must have shape (n, 4) -- rows of (x, y, z, q) in "
+            f"Angstrom -- got shape {arr.shape}")
+    if arr.shape[0] == 0:
+        raise ValueError("point_charges is empty; pass None for no point charges")
+    return arr
+
 # The energy breakdown is ALWAYS returned (every job computes it), so it is not
 # a "property" the caller opts into.
 _ENERGY_ATTRS = ('total_energy', 'nuclear_repulsion', 'e_electronic',
@@ -482,6 +536,7 @@ _SUPPORTED_PROPERTIES = {
     'mulliken_charges',  # needs the DIPOLE keyword to be computed
     'lowdin_charges',    # needs the DIPOLE keyword to be computed
     'dipole',            # dipole moment vector (Debye)
+    'esp_charges',       # ESP-fitted atomic charges (ESP_CHARGE keyword)
 }
 
 # Always returned on the Result because every SCF computes them for free
@@ -489,7 +544,9 @@ _SUPPORTED_PROPERTIES = {
 # compatibility, but they are a no-op there — you get them either way.
 _ALWAYS_ON_PROPERTIES = {
     'mo_energies',       # alpha MO energies
-    'density_matrix',    # alpha density matrix
+    'density_matrix',    # total (restricted) or alpha (unrestricted) density
+    'beta_mo_energies',      # unrestricted runs only
+    'beta_density_matrix',   # unrestricted runs only
 }
 
 # These are all computed inside QUICK's `dipole` routine, which only runs when
@@ -503,11 +560,8 @@ _JOBTYPE_WORDS = {'energy', 'gradient', 'gradients', 'forces',
 # Extras planned for later phases — reported with a clearer message than
 # "unknown property" so callers know they exist but aren't wired up yet.
 _DEFERRED_PROPERTIES = {
-    'beta_mo_energies': 'Phase 3',
-    'beta_density_matrix': 'Phase 3',
     'mp2': 'Phase 3',
     'e_mp2': 'Phase 3',
-    'esp_charges': 'Phase 4',
 }
 
 # opt-in property name -> Result attributes it unlocks.  The conditional energies
@@ -517,7 +571,51 @@ _PROPERTY_ATTRS = {
     'mulliken_charges': ('mulliken',),
     'lowdin_charges': ('lowdin',),
     'dipole': ('dipole',),
+    'esp_charges': ('esp_charges',),
 }
+
+# Raw QUICK keywords that pyquick replaces with its own API, or cannot support,
+# mapped to the message telling the user what to do instead.  Passing them
+# straight through used to run silently and return nothing.
+_REJECTED_KEYWORDS = {
+    'EXTCHARGES': "do not set the EXTCHARGES keyword; pass the charges per call "
+                  "instead: get_energy(geometry, point_charges=[(x, y, z, q), ...])",
+    'ESP_CHARGE': "do not set the ESP_CHARGE keyword; request "
+                  "properties=['esp_charges'] instead",
+    'ESP_GRID': "ESP_GRID (ESP on a user point file) is not supported by pyquick",
+    'EFIELD_GRID': "EFIELD_GRID (field on a user point file) is not supported by pyquick",
+    'EFG_GRID': "EFG_GRID (field gradient on a user point file) is not supported by pyquick",
+}
+
+# Element symbols by atomic number, for the electron count in _check_spin.
+_ELEMENTS = (
+    'H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni '
+    'Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I '
+    'Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt '
+    'Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U').split()
+_ATOMIC_NUMBER = {sym.upper(): z for z, sym in enumerate(_ELEMENTS, start=1)}
+
+
+def _check_spin(geometry, charge, mult):
+    """Raise ValueError if *charge* and *mult* are impossible for *geometry*.
+
+    QUICK detects this too, but reports it by calling exit(), which kills the
+    Python process (or Jupyter kernel) instead of raising.  Lines whose symbol
+    is unknown are skipped; read_geom reports those itself.
+    """
+    nuclear = 0
+    for line in str(geometry).splitlines():
+        fields = line.split()
+        if fields:
+            nuclear += _ATOMIC_NUMBER.get(fields[0].upper(), 0)
+    nelec = nuclear - charge
+    unpaired = mult - 1
+    if nelec < 0 or unpaired > nelec or (nelec - unpaired) % 2 != 0:
+        raise ValueError(
+            f"charge={charge} and mult={mult} are impossible for this molecule "
+            f"({nelec} electrons): mult must be the number of unpaired "
+            f"electrons + 1, so {nelec} electrons need an "
+            f"{'even' if nelec % 2 else 'odd'} mult")
 
 
 def _resolve_method(method, mult):
@@ -626,6 +724,10 @@ class PyQuick:
         self.charge = int(charge)
         self.mult = int(mult)
         self.keywords = dict(keywords) if keywords else {}
+        for k in self.keywords:
+            message = _REJECTED_KEYWORDS.get(str(k).strip().upper())
+            if message:
+                raise ValueError(message)
         self.log = bool(log)
         self._calc_keyword, self._functional = _resolve_method(method, self.mult)
         self._engine = None
@@ -638,6 +740,8 @@ class PyQuick:
             job.set_method(self._functional)
         if any(p in _NEEDS_DIPOLE for p in self.properties):
             job.set_method('DIPOLE')
+        if 'esp_charges' in self.properties:
+            job.set_method('ESP_CHARGE')
         if self.charge != 0:
             job.set_method('CHARGE', str(self.charge))
         if self.mult != 1:
@@ -649,8 +753,9 @@ class PyQuick:
                 job.set_method(key, str(value))
         return job
 
-    def _prepare(self, geometry, name):
-        """Shared setup for a run: engine, output stem, geometry."""
+    def _prepare(self, geometry, name, point_charges):
+        """Shared setup for a run: engine, output stem, geometry, point charges."""
+        _check_spin(geometry, self.charge, self.mult)
         if self._engine is None:
             self._engine = self._build_engine()
         job = self._engine
@@ -659,9 +764,11 @@ class PyQuick:
         # another PyQuick object), silently sending this run's log to that file.
         job.set_output(str(name) if name is not None else _DEFAULT_LOG_STEM)
         job.read_geom(geometry)
+        # always set (or clear): charges belong to this call only
+        job.set_point_charges(_check_point_charges(point_charges))
         return job
 
-    def get_energy(self, geometry, name=None):
+    def get_energy(self, geometry, name=None, point_charges=None):
         """Single-point energy on *geometry*; returns a :class:`Result`.
 
         *geometry* is a 'SYMBOL X Y Z' multi-line string (Angstrom).  *name*
@@ -669,24 +776,30 @@ class PyQuick:
         logging is on, names the log file — ``name='water'`` -> ``water.out``.
         A single engine is reused across successive calls on the same
         PyQuick object, so each call fully finalizes the previous one inside QUICK.
+
+        *point_charges* adds external point charges for this call only: rows of
+        ``(x, y, z, q)``, coordinates in Angstrom.  They act on the molecule
+        (density, ``nuclear_repulsion``, gradient); their mutual repulsion is
+        reported as ``e_external_charge`` and is never part of ``total_energy``.
         """
-        job = self._prepare(geometry, name)
+        job = self._prepare(geometry, name, point_charges)
         job.run(jobtype=0, log=self.log)
         return Result._from_engine(job, self, geometry, name)
 
-    def get_grad(self, geometry, name=None):
+    def get_grad(self, geometry, name=None, point_charges=None):
         """Energy + nuclear gradient on *geometry*; returns a :class:`Result`.
 
         The gradient job runs the SCF and the gradient together, so the returned
         Result carries **both** the energy breakdown and ``gradient`` (dE/dR,
         shape ``(natom, 3)``, Hartree/Bohr) — the energy is not computed twice.
         *name* labels the run and, when logging is on, names the log file.
+        *point_charges* is as for :meth:`get_energy`.
         """
-        job = self._prepare(geometry, name)
+        job = self._prepare(geometry, name, point_charges)
         job.run(jobtype=1, log=self.log)
         return Result._from_engine(job, self, geometry, name)
 
-    def geo_opt(self, geometry, name=None, max_cycles=None):
+    def geo_opt(self, geometry, name=None, max_cycles=None, point_charges=None):
         """Optimize *geometry*; returns a :class:`Result`.
 
         Starting from *geometry*, QUICK relaxes the structure and the Result
@@ -705,6 +818,9 @@ class PyQuick:
 
         Always check ``result.converged`` — a run that hits *max_cycles* returns
         the last step's geometry, which is **not** optimized.
+
+        *point_charges* is as for :meth:`get_energy`; the charges stay fixed
+        while the molecule relaxes.
         """
         # DL-Find (the default) fails on < 3 atoms; steer the user to LOPT.
         using_lopt = any(str(k).upper() == 'LOPT' for k in self.keywords)
@@ -714,12 +830,12 @@ class PyQuick:
                 "molecules with fewer than 3 atoms. Use the Cartesian optimizer: "
                 "PyQuick(..., keywords={'LOPT': None}).")
 
-        job = self._prepare(geometry, name)
+        job = self._prepare(geometry, name, point_charges)
         job.run(jobtype=2, log=self.log,
                 max_cycles=0 if max_cycles is None else int(max_cycles))
         return Result._from_engine(job, self, geometry, name)
 
-    def new_job(self, geometry, reuse_density=True):
+    def new_job(self, geometry, reuse_density=True, point_charges=None):
         """Open a persistent :class:`Job` for one molecule.
 
         Set up the molecule and settings once, then call ``job.run(geom)`` for
@@ -727,8 +843,11 @@ class PyQuick:
         coordinates change).  Each step reuses the converged density from the
         previous one as its SCF guess, so later steps converge faster.  Call
         ``job.delete()`` (or use the job as a context manager) to free the memory.
+
+        *point_charges* (as for :meth:`get_energy`) is fixed for the whole job.
         """
-        return Job(self, geometry, reuse_density=reuse_density)
+        return Job(self, geometry, reuse_density=reuse_density,
+                   point_charges=point_charges)
 
     def copy(self):
         """Return a shallow copy, like :func:`copy.copy`.
@@ -797,7 +916,8 @@ class Result:
         # geometry as parsed by QUICK (atomic numbers + Angstrom coordinates)
         values['atomic_numbers'] = job._results['atomic_numbers']
         values['coordinates'] = job._results['coordinates']
-        for key in ('mulliken', 'lowdin', 'mo_energies', 'density_matrix',
+        for key in ('mulliken', 'lowdin', 'esp_charges', 'mo_energies', 'density_matrix',
+                    'beta_mo_energies', 'beta_density_matrix',
                     'dipole', 'gradient', 'optimized_coordinates', 'converged'):
             if key in job._results:
                 values[key] = job._results[key]
@@ -878,32 +998,62 @@ class Result:
 
     @property
     def e_external_charge(self):
-        """QM <-> external point-charge interaction energy in Hartree.
+        """Repulsion among the external point charges themselves, in Hartree.
 
-        Only available when EXTCHARGES was set in the input.  Reported
+        Only available when the run was given ``point_charges``.  Reported
         separately; never included in ``total_energy``.
         """
         if 'e_external_charge' not in self._values:
             raise AttributeError(
-                "'e_external_charge' is unavailable: EXTCHARGES was not set "
-                "for this calculation — add it via "
-                "PyQuick(..., keywords={'EXTCHARGES': None})")
+                "'e_external_charge' is unavailable: no point charges were "
+                "given for this calculation — pass them via "
+                "get_energy(geometry, point_charges=[(x, y, z, q), ...])")
         return self._values['e_external_charge']
 
     # -- always available (every SCF computes them) --------------------------
     @property
     def mo_energies(self):
-        """Alpha molecular orbital energies, numpy array of shape (NBSuse,)."""
+        """Molecular orbital energies, numpy array of shape (NBSuse,).
+
+        The alpha orbitals on unrestricted (open-shell) runs; see
+        :attr:`beta_mo_energies` for the beta ones.
+        """
         if 'mo_energies' not in self._values:
             raise AttributeError("'mo_energies' was not computed for this run")
         return self._values['mo_energies']
 
     @property
     def density_matrix(self):
-        """Alpha density matrix, numpy array of shape (nbasis, nbasis)."""
+        """Density matrix, numpy array of shape (nbasis, nbasis).
+
+        The TOTAL density on restricted runs (RHF, closed-shell DFT); the ALPHA
+        density on unrestricted (open-shell) runs, where
+        :attr:`beta_density_matrix` holds the beta part (total = alpha + beta).
+        """
         if 'density_matrix' not in self._values:
             raise AttributeError("'density_matrix' was not computed for this run")
         return self._values['density_matrix']
+
+    @property
+    def beta_mo_energies(self):
+        """Beta molecular orbital energies, numpy array of shape (NBSuse,).
+
+        Unrestricted (open-shell) runs only.
+        """
+        if 'beta_mo_energies' not in self._values:
+            raise AttributeError("'beta_mo_energies' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+        return self._values['beta_mo_energies']
+
+    @property
+    def beta_density_matrix(self):
+        """Beta density matrix, numpy array of shape (nbasis, nbasis).
+
+        Unrestricted (open-shell) runs only; :attr:`density_matrix` is then
+        the alpha density.
+        """
+        if 'beta_density_matrix' not in self._values:
+            raise AttributeError("'beta_density_matrix' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+        return self._values['beta_density_matrix']
 
     # -- opt-in arrays (need the DIPOLE keyword) -----------------------------
     @property
@@ -920,6 +1070,15 @@ class Result:
     def dipole(self):
         """Dipole moment vector (x, y, z) in Debye, numpy array of shape (3,)."""
         return self._get('dipole', 'dipole')
+
+    @property
+    def esp_charges(self):
+        """ESP-fitted atomic charges, numpy array of shape (natom,).
+
+        Fitted to the electrostatic potential on Merz-Kollman-Singh surfaces;
+        they sum to the molecular charge.  Request ``properties=['esp_charges']``.
+        """
+        return self._get('esp_charges', 'esp_charges')
 
     # -- gradient (produced by get_grad, not by a `properties` request) -------
     @property
@@ -987,12 +1146,14 @@ class Job:
             energies = [job.run(g).total_energy for g in geometries]
     """
 
-    def __init__(self, calc, geometry, reuse_density=True):
+    def __init__(self, calc, geometry, reuse_density=True, point_charges=None):
         self._calc = calc
         self._reuse_density = bool(reuse_density)   # reserved; density is reused
         self._natoms = _count_atoms(geometry)
+        _check_spin(geometry, calc.charge, calc.mult)
         self._engine = calc._build_engine()
         self._engine.read_geom(geometry)            # fixes the molecule (atoms)
+        self._engine.set_point_charges(_check_point_charges(point_charges))
         self._engine.job_open(log=calc.log)
         self._open = True
 
