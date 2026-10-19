@@ -167,6 +167,11 @@ elseif(MPI)
     string(APPEND _PYQUICK_F90FLAGS " -DMPIV")
 
     # FindMPI gives full library paths; f2py's meson backend wants -L/-l.
+    # f2py turns each -l<name> into a meson variable named <name>, so a name
+    # that is not a valid identifier (Open MPI 4's open-rte, open-pal) breaks
+    # meson setup. Those are internal libraries libmpi itself depends on and
+    # loads, so they are left out; the Fortran bindings (mpi_mpifh, ...) and
+    # libmpi are what pyquick.f90 calls.
     foreach(_mpiinc ${MPI_Fortran_INCLUDE_DIRS} ${MPI_Fortran_MODULE_DIR})
         list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-I${_mpiinc}")
     endforeach()
@@ -174,7 +179,9 @@ elseif(MPI)
         get_filename_component(_mpilibdir "${_mpilib}" DIRECTORY)
         get_filename_component(_mpilibname "${_mpilib}" NAME_WE)
         string(REGEX REPLACE "^lib" "" _mpilibname "${_mpilibname}")
-        list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
+        if(_mpilibname MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+            list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
+        endif()
     endforeach()
     list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
 
