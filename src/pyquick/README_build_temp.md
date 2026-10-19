@@ -1,6 +1,6 @@
 # pyquick — Build & Install Guide
 
-pyquick is QUICK's Python API (`Calculation`/`Job` classes, via f2py). One source tree builds
+pyquick is QUICK's Python API (`PyQuick`/`Job` classes, via f2py). One source tree builds
 either a CPU or a GPU extension — GPU is a **compile-time** choice; nothing changes in your
 Python code afterward, only which install you `source` before `import pyquick`.
 
@@ -79,7 +79,7 @@ quick.hip ../test/ene_H2O_rhf_sto3g.in
 ```bash
 python3 -c "
 import pyquick
-r = pyquick.Calculation(method='HF', basis='STO-3G').get_energy(
+r = pyquick.PyQuick(method='HF', basis='STO-3G').get_energy(
     'O 0 0 0\nH 0 0 0.96\nH 0.93 0 -0.24', name='verify')
 print(r.total_energy)
 "

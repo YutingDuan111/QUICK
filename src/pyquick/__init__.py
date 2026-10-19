@@ -1,3 +1,5 @@
+import copy as _copy
+
 try:
     from ._pyquick import pyquick as _mod
 except ImportError as e:
@@ -24,15 +26,15 @@ def _checked(fn):
 
 
 # ---------------------------------------------------------------------------
-# PyQuick class
+# Low-level engine class
 # ---------------------------------------------------------------------------
 
-class PyQuick:
+class _PyQuickEngine:
     """Object-oriented interface to a single QUICK calculation.
 
     Usage::
 
-        job = PyQuick()
+        job = _PyQuickEngine()
         job.set_calc('HF')
         job.set_basis('STO-3G')
         job.read_geom('''
@@ -260,13 +262,13 @@ class PyQuick:
             self._results['converged'] = bool(_mod.job_opt_converged)
 
     def copy(self):
-        """Return a new PyQuick with the same setup state.
+        """Return a new _PyQuickEngine with the same setup state.
 
         Results from a previous :meth:`run` are not copied — the new instance
         starts unrun.  All setup attributes (_calc, _basis, _methods, _geom)
         are independent copies, so changes to one object do not affect the other.
         """
-        new = PyQuick()
+        new = _PyQuickEngine()
         new._calc    = self._calc
         new._basis   = self._basis
         new._methods = list(self._methods)   # list of immutable tuples — shallow copy is sufficient
@@ -274,6 +276,11 @@ class PyQuick:
         return new
 
     def __copy__(self):
+        return self.copy()
+
+    def __deepcopy__(self, memo):
+        # setup state is strings and tuples of strings, so copy() is already
+        # independent; never clone run state (__del__ would finalize QUICK)
         return self.copy()
 
     def __del__(self):
@@ -443,11 +450,11 @@ class PyQuick:
 
 
 # ---------------------------------------------------------------------------
-# High-level Calculation / Result API
+# High-level PyQuick / Result API
 #
-# Thin wrappers over the low-level PyQuick engine above.  The
+# Thin wrappers over the low-level _PyQuickEngine above.  The
 # engine keeps the canonical pyquick conventions (check()-style errors, in-memory
-# transfer, per-run snapshotting); Calculation/Result are the documented surface.
+# transfer, per-run snapshotting); PyQuick/Result are the documented surface.
 # ---------------------------------------------------------------------------
 
 # Log/output file stem used when a run is given no name. Mirrors the default of
@@ -521,7 +528,7 @@ def _resolve_method(method, mult):
     unrestricted path.
     """
     if not method or not str(method).strip():
-        raise ValueError("Calculation requires a 'method' (e.g. 'HF' or 'B3LYP')")
+        raise ValueError("PyQuick requires a 'method' (e.g. 'HF' or 'B3LYP')")
     if mult < 1:
         raise ValueError(f"multiplicity must be >= 1, got {mult}")
 
@@ -539,7 +546,7 @@ def _resolve_method(method, mult):
     return ('UDFT' if open_shell else 'DFT'), m
 
 
-class Calculation:
+class PyQuick:
     """A reusable set of QUICK calculation settings.
 
     The job type is chosen by which method you call:
@@ -550,8 +557,8 @@ class Calculation:
 
     Example::
 
-        calc = Calculation(method='B3LYP', basis='6-31G*',
-                           properties=['mulliken_charges'])
+        calc = PyQuick(method='B3LYP', basis='6-31G*',
+                       properties=['mulliken_charges'])
         result = calc.get_energy('''
             O  -0.338  0.004  0.239
             H  -0.335 -0.002 -0.833
@@ -584,7 +591,7 @@ class Calculation:
         Write QUICK's diagnostic log (default ``True``).  The file is named after
         the run's *name* -- ``get_energy(geom, name='water')`` -> ``water.out`` --
         or ``pyquick_job.out`` when no name is given.  Successive runs of the same
-        Calculation append; an existing file is backed up to ``<file>~``.
+        PyQuick object append; an existing file is backed up to ``<file>~``.
         ``log=False`` sends the log to the platform null device, so the run leaves
         nothing on disk.
     """
@@ -592,7 +599,7 @@ class Calculation:
     def __init__(self, method, basis, properties=(),
                  charge=0, mult=1, keywords=None, log=True):
         if not basis or not str(basis).strip():
-            raise ValueError("Calculation requires a 'basis' (e.g. '6-31G*')")
+            raise ValueError("PyQuick requires a 'basis' (e.g. '6-31G*')")
 
         requested = {str(p).strip().lower() for p in properties}
         for p in requested:
@@ -624,7 +631,7 @@ class Calculation:
         self._engine = None
 
     def _build_engine(self):
-        job = PyQuick()
+        job = _PyQuickEngine()
         job.set_calc(self._calc_keyword)
         job.set_basis(self.basis)
         if self._functional is not None:
@@ -649,7 +656,7 @@ class Calculation:
         job = self._engine
         # Set the stem on every run, not just when a name is given: it is Fortran
         # module state that would otherwise persist from an earlier run (or from
-        # another Calculation), silently sending this run's log to that file.
+        # another PyQuick object), silently sending this run's log to that file.
         job.set_output(str(name) if name is not None else _DEFAULT_LOG_STEM)
         job.read_geom(geometry)
         return job
@@ -661,7 +668,7 @@ class Calculation:
         labels the run (it lands in ``Result.metadata['name']``) and, when
         logging is on, names the log file — ``name='water'`` -> ``water.out``.
         A single engine is reused across successive calls on the same
-        Calculation, so each call fully finalizes the previous one inside QUICK.
+        PyQuick object, so each call fully finalizes the previous one inside QUICK.
         """
         job = self._prepare(geometry, name)
         job.run(jobtype=0, log=self.log)
@@ -705,7 +712,7 @@ class Calculation:
             raise ValueError(
                 "DL-Find (the default geometry optimizer) does not support "
                 "molecules with fewer than 3 atoms. Use the Cartesian optimizer: "
-                "Calculation(..., keywords={'LOPT': None}).")
+                "PyQuick(..., keywords={'LOPT': None}).")
 
         job = self._prepare(geometry, name)
         job.run(jobtype=2, log=self.log,
@@ -723,6 +730,32 @@ class Calculation:
         """
         return Job(self, geometry, reuse_density=reuse_density)
 
+    def copy(self):
+        """Return a shallow copy, like :func:`copy.copy`.
+
+        Mutable settings (``keywords``, ``properties``) are shared with the
+        original.  The copy always gets its own engine, built on its first run,
+        so later edits to the copy's settings take effect.
+        """
+        return _copy.copy(self)
+
+    def deepcopy(self):
+        """Return a fully independent copy, like :func:`copy.deepcopy`."""
+        return _copy.deepcopy(self)
+
+    def __copy__(self):
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new._engine = None
+        return new
+
+    def __deepcopy__(self, memo):
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            new.__dict__[key] = None if key == '_engine' else _copy.deepcopy(value, memo)
+        return new
+
     @property
     def input_string(self):
         """The assembled QUICK keyword line + basis (no geometry until run)."""
@@ -732,10 +765,10 @@ class Calculation:
 
 
 class Result:
-    """Results of a completed :class:`Calculation` run.
+    """Results of a completed :class:`PyQuick` run.
 
     Properties are accessed as attributes.  Accessing one that was not requested
-    in ``Calculation.properties`` (or could not be computed) raises
+    in ``PyQuick.properties`` (or could not be computed) raises
     ``AttributeError``.
     """
 
@@ -743,6 +776,14 @@ class Result:
         self._values = dict(values)
         self._requested = set(requested)
         self.metadata = dict(metadata)
+
+    def copy(self):
+        """Return a shallow copy, like :func:`copy.copy` (arrays are shared)."""
+        return _copy.copy(self)
+
+    def deepcopy(self):
+        """Return a fully independent copy, like :func:`copy.deepcopy`."""
+        return _copy.deepcopy(self)
 
     @classmethod
     def _from_engine(cls, job, calc, geometry, name):
@@ -776,7 +817,7 @@ class Result:
         if prop not in self._requested:
             raise AttributeError(
                 f"'{attr}' is unavailable: '{prop}' was not requested for this "
-                f"calculation — add '{prop}' to Calculation.properties")
+                f"calculation — add '{prop}' to PyQuick.properties")
         if attr not in self._values:
             raise AttributeError(
                 f"'{attr}' was requested but not computed by QUICK for this job")
@@ -832,7 +873,7 @@ class Result:
             raise AttributeError(
                 "'e_dispersion' is unavailable: no dispersion correction was "
                 "requested for this calculation — add a dispersion keyword, "
-                "e.g. Calculation(..., keywords={'D3': None})")
+                "e.g. PyQuick(..., keywords={'D3': None})")
         return self._values['e_dispersion']
 
     @property
@@ -846,7 +887,7 @@ class Result:
             raise AttributeError(
                 "'e_external_charge' is unavailable: EXTCHARGES was not set "
                 "for this calculation — add it via "
-                "Calculation(..., keywords={'EXTCHARGES': None})")
+                "PyQuick(..., keywords={'EXTCHARGES': None})")
         return self._values['e_external_charge']
 
     # -- always available (every SCF computes them) --------------------------
@@ -885,7 +926,7 @@ class Result:
     def gradient(self):
         """Nuclear gradient dE/dR, numpy array of shape (natom, 3), Hartree/Bohr.
 
-        Only present on a Result from :meth:`Calculation.get_grad`.
+        Only present on a Result from :meth:`PyQuick.get_grad`.
         """
         if 'gradient' not in self._values:
             raise AttributeError(
@@ -898,7 +939,7 @@ class Result:
     def optimized_coordinates(self):
         """Optimized atomic coordinates in Angstrom, shape (natom, 3).
 
-        Only present on a Result from :meth:`Calculation.geo_opt`.  Check
+        Only present on a Result from :meth:`PyQuick.geo_opt`.  Check
         :attr:`converged` before trusting it — a run that hit the cycle limit
         returns the last step's geometry, not an optimized one.
         """
@@ -934,7 +975,7 @@ class Result:
 
 
 class Job:
-    """A persistent QUICK job for one molecule (see :meth:`Calculation.new_job`).
+    """A persistent QUICK job for one molecule (see :meth:`PyQuick.new_job`).
 
     The molecule and settings are set up once; ``run(geometry)`` then computes
     successive geometries of the **same** molecule (same atoms, moving
@@ -980,6 +1021,13 @@ class Job:
 
     def __exit__(self, *exc):
         self.delete()
+
+    def __copy__(self):
+        raise TypeError("a Job owns live QUICK memory and cannot be copied; "
+                        "open another with PyQuick.new_job()")
+
+    def __deepcopy__(self, memo):
+        self.__copy__()
 
     def __del__(self):
         try:

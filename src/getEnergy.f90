@@ -146,6 +146,11 @@ subroutine getEnergy(isGuess, ierr)
       ! parts: electronic energy, core-core repulsion, and some other energy
       ! for specific job
       quick_qm_struct%Eelvac=quick_qm_struct%Eel
+      ! NOTE: the ECharge addition below has no effect -- Etot is overwritten by
+      ! the very next assignment, so TOTAL ENERGY never includes ECharge (the
+      ! external-charge/external-charge repulsion). ECharge is only reported
+      ! separately as "EXT CHARGE REPULSION". The saved references of the
+      ! EXTCHARGES tests depend on this, so changing it means regenerating them.
       if (quick_method%extcharges) then
          quick_qm_struct%Etot = quick_qm_struct%Etot + quick_qm_struct%ECharge
       endif

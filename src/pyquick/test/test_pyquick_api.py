@@ -1,5 +1,5 @@
 """
-pytest unit + integration tests for the pyquick Calculation/Result API.
+pytest unit + integration tests for the pyquick PyQuick/Result API.
 
 Pure-Python tests (validation, method resolution, input assembly) need only that
 the compiled extension imports.  The integration tests additionally run a small
@@ -34,17 +34,17 @@ TOL = 4.0e-5
 
 def test_missing_basis_raises():
     with pytest.raises(ValueError):
-        pyquick.Calculation(method='HF', basis='')
+        pyquick.PyQuick(method='HF', basis='')
 
 
 def test_unknown_property_raises():
     with pytest.raises(ValueError):
-        pyquick.Calculation(method='HF', basis='STO-3G', properties=['bogus'])
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['bogus'])
 
 
 def test_properties_default_empty():
     """No properties needed for an energy run; energy is always returned."""
-    calc = pyquick.Calculation(method='HF', basis='STO-3G')
+    calc = pyquick.PyQuick(method='HF', basis='STO-3G')
     assert calc.properties == set()
 
 
@@ -52,17 +52,17 @@ def test_jobtype_as_property_is_rejected():
     """energy/gradient/optimize are methods now, so they are not valid property values."""
     for bad in ('energy', 'gradient', 'forces', 'optimize', 'optimized_coords'):
         with pytest.raises(ValueError):
-            pyquick.Calculation(method='HF', basis='STO-3G', properties=[bad])
+            pyquick.PyQuick(method='HF', basis='STO-3G', properties=[bad])
 
 
 def test_deferred_property_reports_phase():
     with pytest.raises(ValueError) as excinfo:
-        pyquick.Calculation(method='HF', basis='STO-3G', properties=['esp_charges'])
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['esp_charges'])
     assert 'Phase 4' in str(excinfo.value)
 
 
 def test_dipole_is_a_supported_property():
-    calc = pyquick.Calculation(method='HF', basis='STO-3G', properties=['dipole'])
+    calc = pyquick.PyQuick(method='HF', basis='STO-3G', properties=['dipole'])
     assert 'dipole' in calc.properties
 
 
@@ -90,7 +90,7 @@ def test_resolve_method_bad_mult():
 
 
 def test_input_string_contains_tokens():
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='B3LYP', basis='6-31G*',
         properties=['mulliken_charges'],
         charge=-1, mult=2, keywords={'cutoff': '1e-9'})
@@ -109,7 +109,7 @@ def test_input_string_contains_tokens():
 # ---------------------------------------------------------------------------
 
 def test_geo_opt_optimizes_water():
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G',
         keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
     r = calc.geo_opt(WATER)
@@ -127,7 +127,7 @@ def test_geo_opt_optimizes_water():
 # ---------------------------------------------------------------------------
 
 def _energy(properties=()):
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G', properties=properties,
         keywords={'cutoff': '1.0e-9', 'denserms': '1.0e-6'})
     return calc.get_energy(WATER)
@@ -222,7 +222,7 @@ def test_dipole_not_requested_raises():
 # ---------------------------------------------------------------------------
 
 def _grad(properties=()):
-    calc = pyquick.Calculation(
+    calc = pyquick.PyQuick(
         method='HF', basis='STO-3G', properties=properties,
         keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
     return calc.get_grad(WATER)
@@ -256,7 +256,7 @@ def test_gradient_matches_finite_difference():
         moved = [row[:] for row in atoms]
         moved[atom][1 + comp] = f"{float(moved[atom][1 + comp]) + delta:.6f}"
         geom = "\n".join(" ".join(row) for row in moved)
-        calc = pyquick.Calculation(
+        calc = pyquick.PyQuick(
             method='HF', basis='STO-3G',
             keywords={'cutoff': '1.0e-11', 'denserms': '1.0e-8'})
         return calc.get_energy(geom).total_energy
@@ -269,3 +269,120 @@ def test_gradient_matches_finite_difference():
             # dE/dx in Hartree/Bohr:  (Ang step) -> (Bohr step)
             fd = (e_plus - e_minus) / (2.0 * h / ANG_PER_BOHR)
             assert g[atom, comp] == pytest.approx(fd, abs=2.0e-3)
+
+
+# ---------------------------------------------------------------------------
+# copy() / deepcopy(): mirror Python's copy.copy / copy.deepcopy
+#
+# Shallow copy shares mutable members (keywords dict, properties set, result
+# arrays); deep copy makes them independent.  In both cases a PyQuick copy gets
+# its own engine -- the engine is runtime state, never shared between objects.
+# ---------------------------------------------------------------------------
+
+import copy as _copy
+
+
+def _calc():
+    return pyquick.PyQuick(
+        method='HF', basis='STO-3G', properties=['mulliken_charges'],
+        keywords={'cutoff': '1.0e-9', 'denserms': '1.0e-6'}, log=False)
+
+
+def test_pyquick_copy_is_shallow():
+    a = _calc()
+    b = a.copy()
+    assert b is not a and isinstance(b, pyquick.PyQuick)
+    assert (b.method, b.basis, b.charge, b.mult, b.log) == \
+           (a.method, a.basis, a.charge, a.mult, a.log)
+    # mutable members are shared, like copy.copy
+    assert b.keywords is a.keywords
+    assert b.properties is a.properties
+
+
+def test_pyquick_deepcopy_is_independent():
+    a = _calc()
+    b = a.deepcopy()
+    assert b.keywords == a.keywords and b.keywords is not a.keywords
+    assert b.properties == a.properties and b.properties is not a.properties
+    b.keywords['scf'] = '50'
+    b.properties.add('dipole')
+    assert 'scf' not in a.keywords
+    assert 'dipole' not in a.properties
+
+
+def test_pyquick_copy_module_dispatches_to_methods():
+    a = _calc()
+    shallow = _copy.copy(a)
+    deep = _copy.deepcopy(a)
+    assert shallow.keywords is a.keywords
+    assert deep.keywords is not a.keywords and deep.keywords == a.keywords
+
+
+@pytest.mark.parametrize("how", ["copy", "deepcopy"])
+def test_pyquick_copy_does_not_share_engine(how):
+    """A copy made after a run must build its own engine, so edits to the
+    copy take effect instead of reusing the source's stale engine."""
+    a = _calc()
+    a.get_energy(WATER)
+    b = getattr(a, how)()
+    assert b._engine is None or b._engine is not a._engine
+    b.basis = '6-31G'
+    assert 'BASIS=6-31G' in b.input_string.upper()
+    assert 'BASIS=STO-3G' in a.input_string.upper()
+
+
+@pytest.mark.parametrize("how", ["copy", "deepcopy"])
+def test_pyquick_copy_runs_same_energy(how):
+    a = _calc()
+    ra = a.get_energy(WATER)
+    rb = getattr(a, how)().get_energy(WATER)
+    assert rb.total_energy == pytest.approx(ra.total_energy, abs=1e-10)
+
+
+def test_result_copy_is_shallow():
+    r = _calc().get_energy(WATER)
+    c = r.copy()
+    assert c is not r and isinstance(c, pyquick.Result)
+    assert c.total_energy == r.total_energy
+    # arrays are shared, like copy.copy
+    assert c.density_matrix is r.density_matrix
+    assert c.mulliken is r.mulliken
+    assert _copy.copy(r).density_matrix is r.density_matrix
+
+
+def test_result_deepcopy_is_independent():
+    r = _calc().get_energy(WATER)
+    d = r.deepcopy()
+    assert d.total_energy == r.total_energy
+    assert d.density_matrix is not r.density_matrix
+    assert (d.density_matrix == r.density_matrix).all()
+    d.mulliken[0] = 99.0
+    assert r.mulliken[0] != 99.0
+    assert d.metadata == r.metadata and d.metadata is not r.metadata
+    assert _copy.deepcopy(r).density_matrix is not r.density_matrix
+
+
+def test_result_copy_keeps_property_gating():
+    """A copied Result still raises for properties that were not requested."""
+    r = _calc().get_energy(WATER)
+    for c in (r.copy(), r.deepcopy()):
+        with pytest.raises(AttributeError, match="lowdin_charges"):
+            _ = c.lowdin
+
+
+def test_engine_deepcopy_starts_unrun():
+    """copy.deepcopy on the private engine must not clone a 'ran' engine
+    (its __del__ would then finalize QUICK state it does not own)."""
+    a = _calc()
+    a.get_energy(WATER)
+    e = _copy.deepcopy(a._engine)
+    assert e._ran is False
+    assert e._results == {}
+
+
+@pytest.mark.parametrize("fn", [_copy.copy, _copy.deepcopy])
+def test_job_cannot_be_copied(fn):
+    """A Job owns live Fortran allocations; copying it is refused."""
+    with _calc().new_job(WATER) as job:
+        with pytest.raises(TypeError):
+            fn(job)
