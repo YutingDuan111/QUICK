@@ -7,8 +7,8 @@ HF/STO-3G water job.
 
 Job type is chosen by which method you call:
     calc.get_energy(geometry)  -> single-point energy
-    calc.get_grad(geometry)    -> energy + forces        (Phase 2, not yet implemented)
-    calc.geo_opt(geometry)     -> optimized geometry      (Phase 2, not yet implemented)
+    calc.get_grad(geometry)    -> energy + forces
+    calc.geo_opt(geometry)     -> optimized geometry
 `properties` selects only optional extras (charges, MO energies, density matrix).
 """
 
@@ -58,10 +58,15 @@ def test_jobtype_as_property_is_rejected():
             pyquick.PyQuick(method='HF', basis='STO-3G', properties=[bad])
 
 
-def test_deferred_property_reports_phase():
+@pytest.mark.parametrize("prop", ['mp2', 'e_mp2', 'MP2'])
+def test_mp2_property_not_supported(prop):
+    """MP2 is deliberately not part of pyquick: a plain 'not supported' error,
+    with no promise of a later phase."""
     with pytest.raises(ValueError) as excinfo:
-        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['mp2'])
-    assert 'Phase 3' in str(excinfo.value)
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=[prop])
+    message = str(excinfo.value)
+    assert 'not supported' in message
+    assert 'Phase' not in message and 'planned' not in message
 
 
 def test_dipole_is_a_supported_property():
