@@ -18,6 +18,10 @@ Optional environment variables:
 
 Each case runs in a fresh process, which also matches how the `quick` binary
 references were made (one calculation per process).
+
+Do NOT run this file itself under mpiexec: it would start every launch once per
+rank, and the launched jobs would inherit the outer job's MPI identity.  Under
+mpiexec the whole file is skipped with a pointer to the right command.
 """
 
 import json
@@ -34,10 +38,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MPIEXEC = shlex.split(os.environ.get("PYQUICK_MPIEXEC", "mpiexec"))
 TIMEOUT = 300                       # seconds for one launched job
 
+# Environment variables an MPI launcher sets for its ranks (Open MPI, PMIx,
+# MPICH/Hydra).  A process that inherits them joins that job as a duplicate rank.
+_LAUNCHER_PREFIXES = ('OMPI_', 'PMIX_', 'PRTE_', 'PMI_', 'HYDRA_')
+
+
+def _clean_env(**extra):
+    """os.environ without MPI launcher variables, plus `extra`: every launched
+    process starts as its own job."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_LAUNCHER_PREFIXES)}
+    env.update(extra)
+    return env
+
 
 def _probe(pythonpath=None):
     """Ask a fresh interpreter whether its pyquick is the MPI build (None = no pyquick)."""
-    env = dict(os.environ)
+    env = _clean_env()
     if pythonpath:
         env["PYTHONPATH"] = pythonpath + os.pathsep + env.get("PYTHONPATH", "")
     code = "import pyquick; print(getattr(pyquick, 'mpi_enabled', lambda: False)())"
@@ -46,6 +62,10 @@ def _probe(pythonpath=None):
     return None if p.returncode != 0 else p.stdout.strip().endswith("True")
 
 
+if any(k in os.environ for k in ('OMPI_COMM_WORLD_SIZE', 'PMIX_RANK', 'PMI_RANK', 'PMI_SIZE')):
+    pytest.skip("this file starts mpiexec itself: run it with plain "
+                "`python -m pytest test_pyquick_mpi_launch.py`, not under mpiexec",
+                allow_module_level=True)
 if shutil.which(MPIEXEC[0]) is None:
     pytest.skip(f"{MPIEXEC[0]} not on PATH", allow_module_level=True)
 if not _probe():
@@ -75,7 +95,7 @@ def _launch(tmp_path, script, nranks=None, env_extra=None):
         cmd = [sys.executable, str(path)]
     else:
         cmd = MPIEXEC + ["-n", str(nranks), sys.executable, "-m", "mpi4py", str(path)]
-    env = dict(os.environ, **(env_extra or {}))
+    env = _clean_env(**(env_extra or {}))
     return subprocess.run(cmd, capture_output=True, text=True, cwd=tmp_path,
                           env=env, timeout=TIMEOUT)
 
