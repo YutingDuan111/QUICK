@@ -13,6 +13,7 @@ Job type is chosen by which method you call:
 """
 
 import math
+import os
 
 import pytest
 
@@ -57,8 +58,8 @@ def test_jobtype_as_property_is_rejected():
 
 def test_deferred_property_reports_phase():
     with pytest.raises(ValueError) as excinfo:
-        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['esp_charges'])
-    assert 'Phase 4' in str(excinfo.value)
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['beta_mo_energies'])
+    assert 'Phase 3' in str(excinfo.value)
 
 
 def test_dipole_is_a_supported_property():
@@ -515,3 +516,259 @@ def test_persistent_job_with_point_charges():
     for r in (r1, r2):
         assert r.total_energy == pytest.approx(REF_PC_ENERGY, abs=TOL)
         assert r.e_external_charge == pytest.approx(REF_PC_ECHARGE, abs=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Energy components, dispersion, open shell, ESP
+#
+# Unless noted, references come from the quick binary on the same water
+# geometry and keywords (one calculation per process, so no carried-over state).
+# The binary does not print E1e / E2e / Exc, so those are checked with exact
+# physical identities instead (a one-electron system has no two-electron
+# energy; Hartree-Fock has no XC energy).
+# ---------------------------------------------------------------------------
+
+LOOSE = {'cutoff': '1.0e-9', 'denserms': '1.0e-6'}
+TIGHT = {'cutoff': '1.0e-11', 'denserms': '1.0e-8'}
+H2 = "H 0.0 0.0 0.0\nH 0.0 0.0 0.74"
+
+REF_B3LYP_TOTAL = -75.313101879
+REF_B3LYP_EEL = -83.513573608
+REF_NUC_REP = 8.200471729            # same water geometry for every method
+REF_D3_DISP = -0.000024256
+REF_D3_TOTAL = -75.313126135
+REF_D3BJ_DISP = -0.000575671
+REF_D3BJ_TOTAL = -75.313677549
+REF_D3_GRADIENT = [                  # B3LYP D3, tight cutoffs, Hartree/Bohr
+    [-0.0005385806, -0.0000097318, -0.0001152833],
+    [-0.0276453328, -0.0000015800, -0.0392502864],
+    [ 0.0281839134,  0.0000113118,  0.0393655698],
+]
+REF_UHF_CATION_TOTAL = -74.667074560     # H2O+, charge=1 mult=2
+REF_UB3LYP_CATION_TOTAL = -74.975255182
+REF_UHF_CATION_OPT_TOTAL = -74.669743222
+REF_UHF_CATION_MULLIKEN = [0.1335, 0.4333, 0.4333]   # printed to 4 decimals
+REF_UHF_CATION_LOWDIN = [0.2876, 0.3562, 0.3562]
+REF_UHF_CATION_DIPOLE = [2.2675, -0.0255, -1.6030]   # Debye
+REF_UHF_CATION_GRADIENT = [
+    [-0.0326052848,  0.0003655939,  0.0229508980],
+    [-0.0001705738, -0.0001825317, -0.0347207565],
+    [ 0.0327758586, -0.0001830622,  0.0117698585],
+]
+
+
+def _run(method, keywords=LOOSE, geometry=WATER, **kw):
+    return pyquick.PyQuick(method=method, basis='STO-3G', keywords=keywords,
+                           log=False, **kw).get_energy(geometry)
+
+
+# -- each energy component ----------------------------------------------------
+
+def test_component_total_energy_dft():
+    assert _run('B3LYP').total_energy == pytest.approx(REF_B3LYP_TOTAL, abs=TOL)
+
+
+def test_component_e_electronic_dft():
+    assert _run('B3LYP').e_electronic == pytest.approx(REF_B3LYP_EEL, abs=TOL)
+
+
+def test_component_nuclear_repulsion():
+    """Same geometry -> same nuclear repulsion for every method."""
+    for method in ('HF', 'B3LYP'):
+        assert _run(method).nuclear_repulsion == pytest.approx(REF_NUC_REP, abs=1e-8)
+
+
+def test_component_e_one_electron_one_electron_system():
+    """H2+ has a single electron, so all of its electronic energy is one-electron."""
+    r = _run('HF', geometry=H2, charge=1, mult=2)
+    assert r.e_one_electron == pytest.approx(r.e_electronic, abs=1e-8)
+
+
+def test_component_e_two_electron_zero_for_one_electron_after_dft():
+    """H2+ has no electron pairs: e_two_electron must be 0, even right after a
+    DFT run in the same process (QUICK only sets Exc on the DFT path)."""
+    _run('B3LYP', geometry=H2, charge=1, mult=2)
+    r = _run('HF', geometry=H2, charge=1, mult=2)
+    assert r.e_two_electron == pytest.approx(0.0, abs=1e-8)
+
+
+def test_component_e_xc_zero_for_hf_after_dft():
+    """Hartree-Fock has no XC term, even right after a DFT run."""
+    _run('B3LYP')
+    r = _run('HF')
+    assert r.e_xc == 0.0
+    assert r.e_two_electron == pytest.approx(r.e_electronic - r.e_one_electron, abs=1e-10)
+
+
+def test_component_e_xc_dft_independent_of_previous_run():
+    fresh = _run('B3LYP')
+    _run('HF')
+    _run('BLYP')
+    again = _run('B3LYP')
+    assert fresh.e_xc < -1.0
+    assert again.e_xc == pytest.approx(fresh.e_xc, abs=1e-10)
+    assert again.e_two_electron == pytest.approx(fresh.e_two_electron, abs=1e-10)
+
+
+def test_components_sum_to_total():
+    """total = e_electronic + nuclear_repulsion (+ e_dispersion when set);
+    e_electronic = e_one_electron + e_two_electron + e_xc."""
+    for r in (_run('HF'), _run('B3LYP'), _run('B3LYP', keywords={**LOOSE, 'D3': None})):
+        disp = r.e_dispersion if 'e_dispersion' in r._values else 0.0
+        assert r.total_energy == pytest.approx(
+            r.e_electronic + r.nuclear_repulsion + disp, abs=1e-10)
+        assert r.e_electronic == pytest.approx(
+            r.e_one_electron + r.e_two_electron + r.e_xc, abs=1e-10)
+
+
+# -- dispersion (EDISP) ---------------------------------------------------------
+
+@pytest.mark.parametrize("keyword, ref_disp, ref_total", [
+    ('D3', REF_D3_DISP, REF_D3_TOTAL),
+    ('D3BJ', REF_D3BJ_DISP, REF_D3BJ_TOTAL),
+])
+def test_dispersion_matches_binary(keyword, ref_disp, ref_total):
+    r = _run('B3LYP', keywords={**LOOSE, keyword: None})
+    assert r.e_dispersion == pytest.approx(ref_disp, abs=1e-9)
+    assert r.total_energy == pytest.approx(ref_total, abs=TOL)
+
+
+def test_dispersion_is_part_of_total_energy():
+    """Unlike e_external_charge, the dispersion correction IS in total_energy."""
+    plain = _run('B3LYP')
+    d3 = _run('B3LYP', keywords={**LOOSE, 'D3': None})
+    assert d3.total_energy - plain.total_energy == pytest.approx(d3.e_dispersion, abs=1e-9)
+
+
+def test_dispersion_gradient_matches_binary():
+    r = pyquick.PyQuick('B3LYP', 'STO-3G', keywords={**TIGHT, 'D3': None},
+                        log=False).get_grad(WATER)
+    for got, ref in zip(r.gradient, REF_D3_GRADIENT):
+        assert list(got) == pytest.approx(ref, abs=1e-6)
+
+
+def test_dispersion_not_carried_into_next_run():
+    _run('B3LYP', keywords={**LOOSE, 'D3BJ': None})
+    r = _run('B3LYP', keywords={**LOOSE, 'D3': None})
+    assert r.e_dispersion == pytest.approx(REF_D3_DISP, abs=1e-9)
+    with pytest.raises(AttributeError):
+        _ = _run('B3LYP').e_dispersion
+
+
+# -- open shell -------------------------------------------------------------------
+
+def test_open_shell_uhf_energy_matches_binary():
+    r = _run('HF', charge=1, mult=2)
+    assert r.total_energy == pytest.approx(REF_UHF_CATION_TOTAL, abs=TOL)
+    assert r.metadata['calc_keyword'] == 'UHF'
+
+
+def test_open_shell_udft_energy_matches_binary():
+    r = _run('B3LYP', charge=1, mult=2)
+    assert r.total_energy == pytest.approx(REF_UB3LYP_CATION_TOTAL, abs=TOL)
+    assert r.metadata['calc_keyword'] == 'UDFT'
+
+
+def test_open_shell_gradient_matches_binary():
+    r = pyquick.PyQuick('HF', 'STO-3G', charge=1, mult=2, keywords=TIGHT,
+                        log=False).get_grad(WATER)
+    for got, ref in zip(r.gradient, REF_UHF_CATION_GRADIENT):
+        assert list(got) == pytest.approx(ref, abs=1e-6)
+
+
+def test_open_shell_geo_opt_matches_binary():
+    r = pyquick.PyQuick('HF', 'STO-3G', charge=1, mult=2, keywords=TIGHT,
+                        log=False).geo_opt(WATER)
+    assert r.converged
+    assert r.total_energy == pytest.approx(REF_UHF_CATION_OPT_TOTAL, abs=TOL)
+
+
+def test_open_shell_charges_and_dipole_match_binary():
+    r = _run('HF', charge=1, mult=2,
+             properties=['mulliken_charges', 'lowdin_charges', 'dipole'])
+    assert list(r.mulliken) == pytest.approx(REF_UHF_CATION_MULLIKEN, abs=1e-4)
+    assert list(r.lowdin) == pytest.approx(REF_UHF_CATION_LOWDIN, abs=1e-4)
+    assert list(r.dipole) == pytest.approx(REF_UHF_CATION_DIPOLE, abs=1e-4)
+    assert sum(r.mulliken) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_uhf_closed_shell_equals_rhf():
+    """UHF on a closed-shell molecule must reproduce RHF component by component."""
+    rhf = _run('HF')
+    uhf = _run('UHF')
+    for attr in ('total_energy', 'e_electronic', 'nuclear_repulsion',
+                 'e_one_electron', 'e_two_electron', 'e_xc'):
+        assert getattr(uhf, attr) == pytest.approx(getattr(rhf, attr), abs=1e-7), attr
+
+
+def test_impossible_multiplicity_raises_not_exits():
+    """10 electrons cannot form a doublet.  QUICK reports this by calling
+    exit(), which would kill the Python process (or Jupyter kernel); pyquick
+    must catch it first and raise ValueError.  Run in a subprocess so a
+    failure here cannot take down the test session."""
+    import subprocess, sys, textwrap
+    code = textwrap.dedent(f'''
+        import pyquick
+        try:
+            pyquick.PyQuick('HF', 'STO-3G', mult=2, log=False).get_energy({WATER!r})
+        except ValueError as e:
+            print('VALUEERROR', e)
+    ''')
+    p = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                       timeout=120)
+    assert p.returncode == 0, f"process died (exit {p.returncode}): {p.stdout[-300:]}"
+    assert 'VALUEERROR' in p.stdout
+    assert 'mult' in p.stdout.lower()
+
+
+# -- ESP --------------------------------------------------------------------------
+
+REF_ESP_CHARGES = [-0.522719, 0.261363, 0.261356]           # HF water, printed to 6 dp
+REF_ESP_CHARGES_CATION = [-0.029993, 0.515017, 0.514976]    # UHF H2O+
+
+
+def test_esp_charges_match_binary():
+    r = _run('HF', properties=['esp_charges'])
+    assert list(r.esp_charges) == pytest.approx(REF_ESP_CHARGES, abs=1e-5)
+    assert sum(r.esp_charges) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_esp_charges_open_shell_match_binary():
+    r = _run('HF', charge=1, mult=2, properties=['esp_charges'])
+    assert list(r.esp_charges) == pytest.approx(REF_ESP_CHARGES_CATION, abs=1e-5)
+    assert sum(r.esp_charges) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_esp_charges_from_get_grad():
+    """The binary also fits ESP charges after a gradient job."""
+    r = pyquick.PyQuick('HF', 'STO-3G', properties=['esp_charges'], keywords=LOOSE,
+                        log=False).get_grad(WATER)
+    assert list(r.esp_charges) == pytest.approx(REF_ESP_CHARGES, abs=1e-5)
+
+
+def test_esp_charges_not_requested_raises():
+    _run('HF', properties=['esp_charges'])           # earlier ESP run in this process
+    r = _run('HF')
+    with pytest.raises(AttributeError, match="esp_charges"):
+        _ = r.esp_charges
+
+
+def test_esp_with_log_false_leaves_no_files(tmp_path, monkeypatch):
+    """log=False must leave nothing on disk, including ESP's surface file."""
+    monkeypatch.chdir(tmp_path)
+    _run('HF', properties=['esp_charges'])
+    assert os.listdir(tmp_path) == []
+
+
+@pytest.mark.parametrize("keyword", ['ESP_CHARGE', 'esp_charge'])
+def test_esp_charge_keyword_points_to_property(keyword):
+    """ESP charges are requested with properties=['esp_charges'], not the raw
+    keyword (which used to run silently and return nothing)."""
+    with pytest.raises(ValueError, match="esp_charges"):
+        pyquick.PyQuick('HF', 'STO-3G', keywords={keyword: None})
+
+
+def test_esp_grid_keyword_rejected():
+    """ESP on a user grid needs an external point file; not supported."""
+    with pytest.raises(ValueError, match="(?i)esp_grid"):
+        pyquick.PyQuick('HF', 'STO-3G', keywords={'ESP_GRID': None})

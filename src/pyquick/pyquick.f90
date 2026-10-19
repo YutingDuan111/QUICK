@@ -17,6 +17,8 @@ module pyquick
     use quick_grad_oshell_module, only : oshell_gradient
     use quick_optimizer_module, only : lopt
     use quick_exception_module, only : get_exception_message
+    use quick_molsurface_module, only : generate_MKS_surfaces
+    use quick_oeproperties_module, only : compute_esp, compute_ESP_charge, esp_charges
 
     implicit none
 
@@ -34,6 +36,7 @@ module pyquick
               job_has_mulliken, job_has_lowdin, job_has_mo_energies, job_has_density_matrix, &
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
               job_get_gradients, job_get_geometry, job_exception_message, &
+              job_has_esp, job_get_esp_charges, &
               job_has_optimized, job_opt_converged, job_get_optimized_geometry
 
     integer, parameter :: KEYWORD_LEN = 300
@@ -100,6 +103,7 @@ module pyquick
 
     ! availability flags for array results
     logical :: job_has_mulliken      = .false.
+    logical :: job_has_esp           = .false.
     logical :: job_has_lowdin        = .false.
     logical :: job_has_mo_energies   = .false.
     logical :: job_has_density_matrix = .false.
@@ -613,6 +617,10 @@ contains
         end if
 #endif
 
+        ! QUICK sets Exc only on the DFT path; reset it so an HF run after a DFT
+        ! run in the same process does not report the previous run's value
+        quick_qm_struct%Exc = 0.0d0
+
         ! --- energy, gradient, or optimization ---
         ! quick_method%opt/%grad come from the OPTIMIZE/GRADIENT keywords appended
         ! above. Each branch runs its own SCF, so getEnergy is only called for a
@@ -654,6 +662,9 @@ contains
                 return
             end if
         end if
+
+        ! ESP charges after an energy or gradient job, as main.f90 does
+        if (.not. quick_method%opt) call run_esp_charges()
 
         ! --- post-SCF charges/dipole + harvest all results ---
         call harvest_results(quick_method%grad)
@@ -854,6 +865,8 @@ contains
                             quick_molspec%extchg, ierr)
 #endif
 
+        quick_qm_struct%Exc = 0.0d0   ! see job_run: QUICK sets Exc only for DFT
+
         if (want_gradient /= 0) then
             if (quick_method%unrst) then
                 call oshell_gradient(ierr)
@@ -865,6 +878,7 @@ contains
             call getEnergy(.false., ierr)
             if (ierr /= 0) then; call fail('job_step: getEnergy failed'); return; end if
         end if
+        call run_esp_charges()
 
 #if defined(GPU)
         ! --- GPU: intentionally NOT calling gpu_cleanup() here. ---
@@ -944,6 +958,7 @@ contains
         if (quick_method%dipole) job_dipole = quick_qm_struct%dipole
 
         job_has_mulliken       = quick_method%dipole
+        job_has_esp            = quick_method%esp_charge .and. allocated(esp_charges)
         job_has_lowdin         = quick_method%dipole
         job_has_mo_energies    = allocated(quick_qm_struct%E)
         job_has_density_matrix = allocated(quick_qm_struct%dense)
@@ -971,6 +986,39 @@ contains
     ! Array result getters
     ! Each checks the availability flag and sets had_error if not computed.
     ! -----------------------------------------------------------------------
+
+    subroutine run_esp_charges()
+        ! ESP-fitted charges (ESP_CHARGE keyword). Calls the steps of QUICK's
+        ! compute_oeprop directly -- surface, ESP on it, charge fit -- but skips
+        ! writing the <stem>.vdw surface file, so log=False leaves nothing on
+        ! disk (quick_open cannot target the null device: it renames an
+        ! existing file with mv first).
+        double precision, allocatable :: esp_on_points(:)
+
+        if (allocated(esp_charges)) deallocate(esp_charges)
+        if (.not. quick_method%esp_charge) return
+
+        call generate_MKS_surfaces()
+        allocate(esp_on_points(quick_molspec%nvdwpoint))
+        call compute_esp(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
+        call compute_ESP_charge(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
+        deallocate(esp_on_points)
+        deallocate(quick_molspec%vdwpointxyz)
+    end subroutine run_esp_charges
+
+    subroutine job_get_esp_charges(charges, n)
+        !f2py intent(out) charges, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: charges(10000)
+        charges = 0.0d0
+        n = 0
+        if (.not. job_has_esp) then
+            call fail("ESP charges were not computed; request properties=['esp_charges']")
+            return
+        end if
+        n = size(esp_charges)
+        charges(1:n) = esp_charges
+    end subroutine job_get_esp_charges
 
     subroutine job_get_mulliken(charges, n)
         ! f2py cannot use external module variables as C array bounds, so we

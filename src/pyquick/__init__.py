@@ -261,6 +261,9 @@ class _PyQuickEngine:
         if _mod.job_has_mulliken:
             r, n = _mod.job_get_mulliken()
             self._results['mulliken'] = r[:n].copy()
+        if _mod.job_has_esp:
+            r, n = _mod.job_get_esp_charges()
+            self._results['esp_charges'] = r[:n].copy()
         if _mod.job_has_lowdin:
             r, n = _mod.job_get_lowdin()
             self._results['lowdin'] = r[:n].copy()
@@ -524,6 +527,7 @@ _SUPPORTED_PROPERTIES = {
     'mulliken_charges',  # needs the DIPOLE keyword to be computed
     'lowdin_charges',    # needs the DIPOLE keyword to be computed
     'dipole',            # dipole moment vector (Debye)
+    'esp_charges',       # ESP-fitted atomic charges (ESP_CHARGE keyword)
 }
 
 # Always returned on the Result because every SCF computes them for free
@@ -549,7 +553,6 @@ _DEFERRED_PROPERTIES = {
     'beta_density_matrix': 'Phase 3',
     'mp2': 'Phase 3',
     'e_mp2': 'Phase 3',
-    'esp_charges': 'Phase 4',
 }
 
 # opt-in property name -> Result attributes it unlocks.  The conditional energies
@@ -559,7 +562,51 @@ _PROPERTY_ATTRS = {
     'mulliken_charges': ('mulliken',),
     'lowdin_charges': ('lowdin',),
     'dipole': ('dipole',),
+    'esp_charges': ('esp_charges',),
 }
+
+# Raw QUICK keywords that pyquick replaces with its own API, or cannot support,
+# mapped to the message telling the user what to do instead.  Passing them
+# straight through used to run silently and return nothing.
+_REJECTED_KEYWORDS = {
+    'EXTCHARGES': "do not set the EXTCHARGES keyword; pass the charges per call "
+                  "instead: get_energy(geometry, point_charges=[(x, y, z, q), ...])",
+    'ESP_CHARGE': "do not set the ESP_CHARGE keyword; request "
+                  "properties=['esp_charges'] instead",
+    'ESP_GRID': "ESP_GRID (ESP on a user point file) is not supported by pyquick",
+    'EFIELD_GRID': "EFIELD_GRID (field on a user point file) is not supported by pyquick",
+    'EFG_GRID': "EFG_GRID (field gradient on a user point file) is not supported by pyquick",
+}
+
+# Element symbols by atomic number, for the electron count in _check_spin.
+_ELEMENTS = (
+    'H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni '
+    'Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I '
+    'Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt '
+    'Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U').split()
+_ATOMIC_NUMBER = {sym.upper(): z for z, sym in enumerate(_ELEMENTS, start=1)}
+
+
+def _check_spin(geometry, charge, mult):
+    """Raise ValueError if *charge* and *mult* are impossible for *geometry*.
+
+    QUICK detects this too, but reports it by calling exit(), which kills the
+    Python process (or Jupyter kernel) instead of raising.  Lines whose symbol
+    is unknown are skipped; read_geom reports those itself.
+    """
+    nuclear = 0
+    for line in str(geometry).splitlines():
+        fields = line.split()
+        if fields:
+            nuclear += _ATOMIC_NUMBER.get(fields[0].upper(), 0)
+    nelec = nuclear - charge
+    unpaired = mult - 1
+    if nelec < 0 or unpaired > nelec or (nelec - unpaired) % 2 != 0:
+        raise ValueError(
+            f"charge={charge} and mult={mult} are impossible for this molecule "
+            f"({nelec} electrons): mult must be the number of unpaired "
+            f"electrons + 1, so {nelec} electrons need an "
+            f"{'even' if nelec % 2 else 'odd'} mult")
 
 
 def _resolve_method(method, mult):
@@ -668,10 +715,10 @@ class PyQuick:
         self.charge = int(charge)
         self.mult = int(mult)
         self.keywords = dict(keywords) if keywords else {}
-        if any(str(k).strip().upper() == 'EXTCHARGES' for k in self.keywords):
-            raise ValueError(
-                "do not set the EXTCHARGES keyword; pass the charges per call "
-                "instead: get_energy(geometry, point_charges=[(x, y, z, q), ...])")
+        for k in self.keywords:
+            message = _REJECTED_KEYWORDS.get(str(k).strip().upper())
+            if message:
+                raise ValueError(message)
         self.log = bool(log)
         self._calc_keyword, self._functional = _resolve_method(method, self.mult)
         self._engine = None
@@ -684,6 +731,8 @@ class PyQuick:
             job.set_method(self._functional)
         if any(p in _NEEDS_DIPOLE for p in self.properties):
             job.set_method('DIPOLE')
+        if 'esp_charges' in self.properties:
+            job.set_method('ESP_CHARGE')
         if self.charge != 0:
             job.set_method('CHARGE', str(self.charge))
         if self.mult != 1:
@@ -697,6 +746,7 @@ class PyQuick:
 
     def _prepare(self, geometry, name, point_charges):
         """Shared setup for a run: engine, output stem, geometry, point charges."""
+        _check_spin(geometry, self.charge, self.mult)
         if self._engine is None:
             self._engine = self._build_engine()
         job = self._engine
@@ -857,7 +907,7 @@ class Result:
         # geometry as parsed by QUICK (atomic numbers + Angstrom coordinates)
         values['atomic_numbers'] = job._results['atomic_numbers']
         values['coordinates'] = job._results['coordinates']
-        for key in ('mulliken', 'lowdin', 'mo_energies', 'density_matrix',
+        for key in ('mulliken', 'lowdin', 'esp_charges', 'mo_energies', 'density_matrix',
                     'dipole', 'gradient', 'optimized_coordinates', 'converged'):
             if key in job._results:
                 values[key] = job._results[key]
@@ -981,6 +1031,15 @@ class Result:
         """Dipole moment vector (x, y, z) in Debye, numpy array of shape (3,)."""
         return self._get('dipole', 'dipole')
 
+    @property
+    def esp_charges(self):
+        """ESP-fitted atomic charges, numpy array of shape (natom,).
+
+        Fitted to the electrostatic potential on Merz-Kollman-Singh surfaces;
+        they sum to the molecular charge.  Request ``properties=['esp_charges']``.
+        """
+        return self._get('esp_charges', 'esp_charges')
+
     # -- gradient (produced by get_grad, not by a `properties` request) -------
     @property
     def gradient(self):
@@ -1051,6 +1110,7 @@ class Job:
         self._calc = calc
         self._reuse_density = bool(reuse_density)   # reserved; density is reused
         self._natoms = _count_atoms(geometry)
+        _check_spin(geometry, calc.charge, calc.mult)
         self._engine = calc._build_engine()
         self._engine.read_geom(geometry)            # fixes the molecule (atoms)
         self._engine.set_point_charges(_check_point_charges(point_charges))
