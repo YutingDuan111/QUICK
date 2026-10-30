@@ -911,3 +911,448 @@ def test_persistent_dft_job_with_moving_geometry():
     for g, r in zip(geometries, steps):
         assert r.total_energy == pytest.approx(ref[g], abs=TOL)
     assert steps[3].gradient.shape == (3, 3)
+
+
+# ---------------------------------------------------------------------------
+# Gradient on the external point charges (Result.point_charge_gradient)
+#
+# dE/dR of each charge, (ncharges, 3), Hartree/Bohr.  total_energy leaves out
+# the charge-charge repulsion, so this gradient is the derivative of
+# total_energy and does not contain that term either: finite differences of
+# total_energy reproduce it, and the forces on atoms + charges sum to zero.
+# ---------------------------------------------------------------------------
+
+CLOSE_CHARGES = [(2.5, 0.5, 0.0, 0.6), (-1.0, 2.5, 0.5, -0.4)]   # near enough to polarize
+
+
+def _pc_grad(method='HF', charges=CHARGES, **kw):
+    return pyquick.PyQuick(method, 'STO-3G', keywords=TIGHT, log=False, **kw).get_grad(
+        WATER, point_charges=charges)
+
+
+def test_point_charge_gradient_shape():
+    assert _pc_grad().point_charge_gradient.shape == (2, 3)
+    assert _pc_grad(charges=[CHARGES[0]]).point_charge_gradient.shape == (1, 3)
+
+
+@pytest.mark.parametrize("method, kw", [
+    ('HF', {}),
+    ('HF', {'charge': 1, 'mult': 2}),
+    ('B3LYP', {}),
+])
+def test_point_charge_gradient_matches_finite_difference(method, kw):
+    """Central finite differences of total_energy against moving each charge."""
+    ANG_PER_BOHR = 0.52917721067
+    h = 0.01                                # Angstrom
+    calc = pyquick.PyQuick(method, 'STO-3G', keywords=TIGHT, log=False, **kw)
+    analytic = calc.get_grad(WATER, point_charges=CLOSE_CHARGES).point_charge_gradient
+
+    def energy(icharge, comp, delta):
+        moved = [list(c) for c in CLOSE_CHARGES]
+        moved[icharge][comp] += delta
+        return calc.get_energy(WATER, point_charges=moved).total_energy
+
+    for icharge in range(len(CLOSE_CHARGES)):
+        for comp in range(3):
+            fd = (energy(icharge, comp, h) - energy(icharge, comp, -h)) / (2 * h / ANG_PER_BOHR)
+            assert analytic[icharge, comp] == pytest.approx(fd, abs=1e-5)
+
+
+@pytest.mark.parametrize("method, abs_tol", [('HF', 1e-8), ('B3LYP', 1e-3)])
+def test_forces_on_atoms_and_charges_sum_to_zero(method, abs_tol):
+    """QM + charges is an isolated system (the DFT grid breaks this slightly)."""
+    r = _pc_grad(method, charges=CLOSE_CHARGES)
+    total = r.gradient.sum(axis=0) + r.point_charge_gradient.sum(axis=0)
+    assert list(total) == pytest.approx([0.0, 0.0, 0.0], abs=abs_tol)
+
+
+def test_point_charge_gradient_needs_get_grad():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    r = calc.get_energy(WATER, point_charges=CHARGES)
+    with pytest.raises(AttributeError, match="get_grad"):
+        _ = r.point_charge_gradient
+
+
+def test_point_charge_gradient_needs_point_charges():
+    r = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False).get_grad(WATER)
+    with pytest.raises(AttributeError, match="point_charges"):
+        _ = r.point_charge_gradient
+
+
+def test_point_charge_gradient_not_carried_into_next_run():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    assert calc.get_grad(WATER, point_charges=CHARGES).point_charge_gradient.shape == (2, 3)
+    assert calc.get_grad(WATER, point_charges=[CHARGES[0]]).point_charge_gradient.shape == (1, 3)
+    with pytest.raises(AttributeError, match="point_charges"):
+        _ = calc.get_grad(WATER).point_charge_gradient
+
+
+def test_point_charge_gradient_in_persistent_job():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=TIGHT, log=False)
+    ref = calc.get_grad(WATER, point_charges=CHARGES).point_charge_gradient
+    with calc.new_job(WATER, point_charges=CHARGES) as job:
+        energy_step = job.run(WATER)
+        grad_step = job.run(WATER, gradient=True)
+    assert np.allclose(grad_step.point_charge_gradient, ref, atol=1e-6)
+    with pytest.raises(AttributeError):
+        _ = energy_step.point_charge_gradient
+
+
+# ---------------------------------------------------------------------------
+# Optimization trajectory (Result.trajectory_energies / trajectory_coordinates)
+#
+# References are the [GEOCONV] energies of the quick binary's Molden export on
+# the same input.  Entry 0 is the input geometry, the last is the final one.
+# QUICK stores Eel + Ecore per step, so these energies leave out any dispersion
+# correction.
+# ---------------------------------------------------------------------------
+
+REF_TRAJ_DLFIND = [-74.94786381, -74.95030381, -74.96091494, -74.96560980,
+                   -74.96588737, -74.96589936, -74.96590121, -74.96590121]
+REF_TRAJ_LOPT = [-74.94786211, -74.92888436, -74.91224831, -74.96105792, -74.96414305,
+                 -74.96562617, -74.96560561, -74.96585794, -74.96590087, -74.96590110]
+METHANE = ("C 0 0 0\nH 0.6291 0.6291 0.6291\nH -0.6291 -0.6291 0.6291\n"
+           "H -0.6291 0.6291 -0.6291\nH 0.6291 -0.6291 -0.6291")
+
+
+def _opt(method='HF', keywords=LOOSE, geometry=WATER, max_cycles=None, **kw):
+    return pyquick.PyQuick(method, 'STO-3G', keywords=keywords, log=False, **kw).geo_opt(
+        geometry, max_cycles=max_cycles)
+
+
+def test_trajectory_dlfind_matches_binary():
+    r = _opt()
+    assert list(r.trajectory_energies) == pytest.approx(REF_TRAJ_DLFIND, abs=1e-6)
+
+
+def test_trajectory_lopt_matches_binary():
+    r = _opt(keywords={**LOOSE, 'LOPT': None})
+    assert list(r.trajectory_energies) == pytest.approx(REF_TRAJ_LOPT, abs=1e-6)
+
+
+@pytest.mark.parametrize("keywords", [LOOSE, {**LOOSE, 'LOPT': None}], ids=['dlfind', 'lopt'])
+def test_trajectory_shape_and_endpoints(keywords):
+    r = _opt(keywords=keywords)
+    n = len(r.trajectory_energies)
+    assert r.trajectory_coordinates.shape == (n, 3, 3)
+    assert np.allclose(r.trajectory_coordinates[0], r.coordinates, atol=1e-5)     # input
+    assert np.allclose(r.trajectory_coordinates[-1], r.optimized_coordinates, atol=1e-5)
+    assert r.trajectory_energies[-1] == pytest.approx(r.total_energy, abs=TOL)
+
+
+def test_trajectory_open_shell():
+    r = _opt(charge=1, mult=2)
+    assert len(r.trajectory_energies) == 7                       # binary: 7 steps
+    assert r.trajectory_energies[-1] == pytest.approx(REF_UHF_CATION_OPT_TOTAL, abs=TOL)
+
+
+def test_trajectory_dft():
+    r = _opt('B3LYP')
+    assert r.trajectory_energies[-1] == pytest.approx(r.total_energy, abs=TOL)
+    assert r.trajectory_energies[0] == pytest.approx(REF_B3LYP_TOTAL, abs=TOL)
+
+
+def test_trajectory_energies_leave_out_dispersion():
+    r = _opt('B3LYP', keywords={**LOOSE, 'D3': None})
+    assert r.trajectory_energies[-1] + r.e_dispersion == pytest.approx(r.total_energy, abs=TOL)
+
+
+def test_trajectory_respects_max_cycles():
+    r = _opt(max_cycles=2)
+    assert not r.converged
+    assert len(r.trajectory_energies) <= 3
+
+
+@pytest.mark.parametrize("run", ['get_energy', 'get_grad'])
+def test_trajectory_only_from_geo_opt(run):
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    r = getattr(calc, run)(WATER)
+    with pytest.raises(AttributeError, match="geo_opt"):
+        _ = r.trajectory_energies
+    with pytest.raises(AttributeError, match="geo_opt"):
+        _ = r.trajectory_coordinates
+
+
+def test_lopt_choice_not_carried_into_next_optimization():
+    """QUICK does not reset its optimizer choice between runs in one process."""
+    assert len(_opt().trajectory_energies) == 8                       # DL-Find
+    assert len(_opt(keywords={**LOOSE, 'LOPT': None}).trajectory_energies) == 10
+    assert len(_opt().trajectory_energies) == 8                       # DL-Find again
+
+
+def test_trajectory_not_carried_between_runs():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    assert len(calc.geo_opt(WATER).trajectory_energies) == 8
+    with pytest.raises(AttributeError):
+        _ = calc.get_energy(WATER).trajectory_energies
+
+
+def test_trajectory_across_molecule_sizes():
+    """Sizes change between optimizations, in both directions and on the UHF
+    path (which also writes MOs through the Molden code)."""
+    kw = {**LOOSE, 'LOPT': None}
+    assert _opt(keywords=kw, charge=1, mult=2).trajectory_coordinates.shape[1:] == (3, 3)
+    r = _opt(keywords=kw, geometry=METHANE, charge=1, mult=2, max_cycles=3)
+    assert r.trajectory_coordinates.shape[1:] == (5, 3)
+    # Known QUICK bug, not pyquick's: the plain quick.cuda.MPI binary also crashes on
+    # a gradient of a molecule with s functions only (cudaMemcpy illegal access).
+    if not (pyquick.mpi_enabled() and pyquick.gpu_enabled()):
+        r = _opt(keywords=kw, geometry=H2)
+        assert r.trajectory_coordinates.shape[1:] == (2, 3)
+
+
+@pytest.mark.parametrize("log", [False, True])
+def test_geo_opt_leaves_no_molden_file(tmp_path, monkeypatch, log):
+    """The trajectory borrows QUICK's Molden storage, never its file output."""
+    monkeypatch.chdir(tmp_path)
+    for kw in ({}, {'charge': 1, 'mult': 2}):
+        pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=log, **kw).geo_opt(WATER)
+    left = sorted(os.listdir(tmp_path))
+    assert not [f for f in left if 'molden' in f.lower() or f.startswith('fort.')], left
+    if not log:
+        assert left == []
+
+
+def test_energy_run_after_geo_opt_still_works():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    calc.geo_opt(WATER)
+    assert calc.get_energy(WATER).total_energy == pytest.approx(REF_ENERGY, abs=TOL)
+
+
+# ---------------------------------------------------------------------------
+# MO coefficients, occupations, overlap matrix, AO labels
+#
+# Orbital signs are arbitrary (and differ on CUDA), so everything here is
+# sign-independent: densities rebuilt from occupied orbitals, orthonormality,
+# Mulliken charges rebuilt through ao_labels, and |C| against the binary's
+# Molden export (UHF H2O+, first alpha orbital).
+# ---------------------------------------------------------------------------
+
+REF_ALPHA_MO1_ABS = [0.9942744458, 0.0249409997, 0.0025914814, 0.0000291075,
+                     0.0018332622, 0.0049040562, 0.0049027141]
+Z = {'H': 1.0, 'C': 6.0, 'O': 8.0}
+
+
+def _occupied(c, occupations):
+    return c[:, occupations > 0.5]
+
+
+def test_mo_coefficients_shape():
+    r = _run('HF')
+    assert r.mo_coefficients.shape == (7, 7)              # (nbasis, nmo): columns are MOs
+    assert r.mo_occupations.shape == (7,)
+
+
+def test_mo_occupations_restricted():
+    assert list(_run('HF').mo_occupations) == [2.0] * 5 + [0.0] * 2
+
+
+def test_mo_occupations_unrestricted():
+    r = _run('HF', charge=1, mult=2)
+    assert list(r.mo_occupations) == [1.0] * 5 + [0.0] * 2
+    assert list(r.beta_mo_occupations) == [1.0] * 4 + [0.0] * 3
+
+
+@pytest.mark.parametrize("method", ['HF', 'B3LYP'])
+def test_density_from_occupied_orbitals_restricted(method):
+    r = _run(method)
+    c = _occupied(r.mo_coefficients, r.mo_occupations)
+    assert np.allclose(2.0 * c @ c.T, r.density_matrix, atol=1e-7)
+
+
+@pytest.mark.parametrize("method", ['HF', 'B3LYP'])
+def test_density_from_occupied_orbitals_unrestricted(method):
+    r = _run(method, charge=1, mult=2)
+    a = _occupied(r.mo_coefficients, r.mo_occupations)
+    b = _occupied(r.beta_mo_coefficients, r.beta_mo_occupations)
+    assert np.allclose(a @ a.T, r.density_matrix, atol=1e-7)
+    assert np.allclose(b @ b.T, r.beta_density_matrix, atol=1e-7)
+
+
+def test_mo_coefficients_match_binary_up_to_sign():
+    r = _run('HF', charge=1, mult=2)
+    assert list(np.abs(r.mo_coefficients[:, 0])) == pytest.approx(REF_ALPHA_MO1_ABS, abs=1e-6)
+
+
+def test_mo_coefficients_are_orthonormal():
+    r = _run('HF')
+    c, s = r.mo_coefficients, r.overlap_matrix
+    assert np.allclose(c.T @ s @ c, np.eye(7), atol=1e-8)
+
+
+def test_overlap_matrix_properties():
+    s = _run('HF').overlap_matrix
+    assert s.shape == (7, 7)
+    assert np.allclose(s, s.T, atol=1e-12)
+    assert list(np.diag(s)) == pytest.approx([1.0] * 7, abs=1e-8)
+
+
+def test_electron_count_from_density_and_overlap():
+    r = _run('HF')
+    assert np.trace(r.density_matrix @ r.overlap_matrix) == pytest.approx(10.0, abs=1e-6)
+    r = _run('HF', charge=1, mult=2)
+    total = r.density_matrix + r.beta_density_matrix
+    assert np.trace(total @ r.overlap_matrix) == pytest.approx(9.0, abs=1e-6)
+
+
+def test_ao_labels_water_sto3g():
+    assert _run('HF').ao_labels == [
+        (0, 'O', 's'), (0, 'O', 's'), (0, 'O', 'px'), (0, 'O', 'py'), (0, 'O', 'pz'),
+        (1, 'H', 's'), (2, 'H', 's')]
+
+
+def test_ao_labels_cartesian_d_functions():
+    r = pyquick.PyQuick('HF', '6-31G*', keywords=LOOSE, log=False).get_energy(WATER)
+    assert len(r.ao_labels) == r.mo_coefficients.shape[0] == 19
+    d = [t for atom, sym, t in r.ao_labels if t[0] == 'd']
+    assert sorted(d) == sorted(['dxx', 'dyy', 'dzz', 'dxy', 'dxz', 'dyz'])
+
+
+def test_mulliken_rebuilt_through_ao_labels():
+    """Population per atom = sum of diag(PS) over that atom's basis functions."""
+    r = _run('HF', properties=['mulliken_charges'])
+    pop = np.diag(r.density_matrix @ r.overlap_matrix)
+    natoms = len(r.atomic_numbers)
+    charges = list(r.atomic_numbers.astype(float))
+    for (atom, _sym, _kind), p in zip(r.ao_labels, pop):
+        charges[atom] -= p
+    assert charges == pytest.approx(list(r.mulliken), abs=1e-5)
+    assert len(charges) == natoms
+
+
+def test_beta_mo_coefficients_unavailable_for_restricted():
+    r = _run('HF')
+    with pytest.raises(AttributeError, match="unrestricted"):
+        _ = r.beta_mo_coefficients
+    with pytest.raises(AttributeError, match="unrestricted"):
+        _ = r.beta_mo_occupations
+
+
+def test_mo_coefficients_after_geo_opt_match_final_density():
+    r = _opt()
+    c = _occupied(r.mo_coefficients, r.mo_occupations)
+    assert np.allclose(2.0 * c @ c.T, r.density_matrix, atol=1e-6)
+
+
+def test_mo_coefficients_in_persistent_job():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=LOOSE, log=False)
+    with calc.new_job(WATER) as job:
+        job.run(WATER)
+        r = job.run(WATER_STRETCHED)
+    c = _occupied(r.mo_coefficients, r.mo_occupations)
+    assert np.allclose(2.0 * c @ c.T, r.density_matrix, atol=1e-7)
+
+
+def test_mo_arrays_follow_the_molecule_size():
+    assert _run('HF', geometry=H2).mo_coefficients.shape == (2, 2)
+    r = _run('HF')
+    assert r.mo_coefficients.shape == (7, 7)
+    assert r.overlap_matrix.shape == (7, 7)
+    assert len(r.ao_labels) == 7
+
+
+def test_larger_basis_after_smaller_one():
+    """QUICK sizes some tables once per process (under MPI, its load-balancing
+    tables); a later, larger run must not overrun them."""
+    def energy(basis, geometry=WATER):
+        return pyquick.PyQuick('HF', basis, keywords=LOOSE, log=False).get_energy(
+            geometry).total_energy
+    small = energy('STO-3G', H2)
+    large = energy('6-31G*')
+    assert energy('6-31G*') == pytest.approx(large, abs=1e-8)
+    assert energy('STO-3G', H2) == pytest.approx(small, abs=1e-8)
+    assert energy('6-31G*') == pytest.approx(large, abs=1e-8)
+
+
+def test_new_always_on_names_accepted_in_properties():
+    names = ['mo_coefficients', 'mo_occupations', 'beta_mo_coefficients',
+             'beta_mo_occupations', 'overlap_matrix', 'ao_labels']
+    calc = pyquick.PyQuick('HF', 'STO-3G', properties=names)
+    assert calc.properties == set(names)
+
+
+# ---------------------------------------------------------------------------
+# Kinetic vs nuclear-attraction split of e_one_electron
+#
+# QUICK does not print these, so references come from PySCF on the same inputs
+# (its total energies agree with QUICK's to ~2e-8; d functions are Cartesian).
+# 6-31G* needs QUICK's own basis file there: PySCF's copy differs slightly, which
+# barely moves the energy but shifts T and V by ~1e-5.
+# T and V are first-order in the density, unlike the total energy, so these
+# comparisons need a tightly converged SCF (TIGHT).
+# The split is exact: e_kinetic + e_nuclear_attraction = e_one_electron.
+# ---------------------------------------------------------------------------
+
+REF_T_WATER, REF_V_WATER = 74.379235552, -194.987647603
+REF_T_CATION, REF_V_CATION = 72.931488501, -187.971278133
+REF_T_631GS, REF_V_631GS = 75.437464045, -196.701521176    # with QUICK's basis file
+REF_T_H2P, REF_V_H2P = 0.600643589, -1.853953375
+REF_T_PC, REF_V_PC = 74.342682280, -194.856139946    # with CHARGES, nuclei only
+REF_V_PC_CHARGES = -1.852708119                    # electrons <-> CHARGES
+
+
+@pytest.mark.parametrize("kw, ref_t, ref_v", [
+    ({}, REF_T_WATER, REF_V_WATER),
+    ({'charge': 1, 'mult': 2}, REF_T_CATION, REF_V_CATION),
+    ({'charge': 1, 'mult': 2, 'geometry': H2}, REF_T_H2P, REF_V_H2P),
+], ids=['rhf', 'uhf', 'one-electron'])
+def test_kinetic_and_attraction_match_pyscf(kw, ref_t, ref_v):
+    r = _run('HF', keywords=TIGHT, **kw)
+    assert r.e_kinetic == pytest.approx(ref_t, abs=1e-5)
+    assert r.e_nuclear_attraction == pytest.approx(ref_v, abs=1e-5)
+
+
+def test_kinetic_cartesian_d_functions_match_pyscf():
+    r = pyquick.PyQuick('HF', '6-31G*', keywords=TIGHT, log=False).get_energy(WATER)
+    assert r.e_kinetic == pytest.approx(REF_T_631GS, abs=1e-5)
+    assert r.e_nuclear_attraction == pytest.approx(REF_V_631GS, abs=1e-5)
+
+
+def test_one_electron_energy_is_whole_under_mpi():
+    """Each MPI rank holds part of E1e; the Result must carry the sum."""
+    assert _run('HF', keywords=TIGHT).e_one_electron == pytest.approx(
+        REF_T_WATER + REF_V_WATER, abs=1e-5)
+
+
+@pytest.mark.parametrize("method, kw", [('HF', {}), ('B3LYP', {}), ('B3LYP', {'charge': 1, 'mult': 2})])
+def test_split_adds_up_to_one_electron_energy(method, kw):
+    r = _run(method, **kw)
+    assert r.e_kinetic + r.e_nuclear_attraction == pytest.approx(r.e_one_electron, abs=1e-10)
+    assert r.e_kinetic > 0 and r.e_nuclear_attraction < 0
+
+
+def test_attraction_includes_point_charges():
+    """e_nuclear_attraction also holds the electrons' attraction to the charges."""
+    r = pyquick.PyQuick('HF', 'STO-3G', keywords=TIGHT, log=False).get_energy(
+        WATER, point_charges=CHARGES)
+    assert r.e_kinetic == pytest.approx(REF_T_PC, abs=1e-5)
+    assert r.e_nuclear_attraction == pytest.approx(REF_V_PC + REF_V_PC_CHARGES, abs=1e-5)
+
+
+def test_split_from_get_grad_matches_get_energy():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=TIGHT, log=False)
+    assert calc.get_grad(WATER).e_kinetic == pytest.approx(REF_T_WATER, abs=1e-5)
+
+
+def test_split_after_geo_opt_is_for_the_final_geometry():
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=TIGHT, log=False)
+    r = calc.geo_opt(WATER)
+    final = "\n".join(f"{s} {x:.8f} {y:.8f} {z:.8f}" for s, (x, y, z) in
+                      zip(['O', 'H', 'H'], r.optimized_coordinates))
+    assert r.e_kinetic == pytest.approx(calc.get_energy(final).e_kinetic, abs=1e-4)
+
+
+def test_split_in_persistent_job_leaves_later_steps_intact():
+    """Rebuilding the kinetic matrix borrows QUICK's Fock array; steps must not notice."""
+    calc = pyquick.PyQuick('HF', 'STO-3G', keywords=TIGHT, log=False)
+    with calc.new_job(WATER) as job:
+        job.run(WATER_STRETCHED)
+        r = job.run(WATER, gradient=True)
+    assert r.total_energy == pytest.approx(REF_ENERGY, abs=TOL)
+    assert r.e_kinetic == pytest.approx(REF_T_WATER, abs=1e-5)
+
+
+def test_split_does_not_disturb_properties():
+    r = _run('HF', properties=['mulliken_charges', 'dipole', 'esp_charges'])
+    assert sum(r.mulliken) == pytest.approx(0.0, abs=1e-6)
+    assert list(r.esp_charges) == pytest.approx(REF_ESP_CHARGES, abs=1e-5)

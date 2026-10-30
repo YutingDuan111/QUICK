@@ -239,7 +239,7 @@ class _PyQuickEngine:
 
         *jobtype* selects the work: ``0`` = single-point energy, ``1`` = energy
         + nuclear gradient, ``2`` = geometry optimization.  *max_cycles* applies
-        to ``jobtype=2`` only: ``<= 0`` runs to convergence with no cap (QUICK's
+        to ``jobtype=2`` only: ``<= 0`` uses the default cap of 2000 steps (QUICK's
         default), ``> 0`` caps the optimization cycles.  *log* writes QUICK's
         diagnostic output to
         ``<stem>.out`` (see :meth:`set_output`); ``log=False`` sends it to the
@@ -337,6 +337,9 @@ class _PyQuickEngine:
         self._results['e_electronic']      = float(_mod.job_e_electronic)
         self._results['e_one_electron']    = float(_mod.job_e_1e)
         self._results['e_xc']              = float(_mod.job_e_xc)
+        self._results['e_kinetic']         = float(_mod.job_e_kinetic)
+        self._results['e_nuclear_attraction'] = (self._results['e_one_electron']
+                                                 - self._results['e_kinetic'])
         # two-electron energy (J + K combined) by exact bookkeeping:
         # EEl = E1e + E2e + Exc  =>  E2e = EEl - E1e - Exc
         self._results['e_two_electron'] = (self._results['e_electronic']
@@ -367,13 +370,35 @@ class _PyQuickEngine:
         if _mod.job_has_density_matrix:
             r, nr, nc = _mod.job_get_density_matrix()
             self._results['density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
+        nbasis, nmo = int(_mod.job_nbasis), int(_mod.job_nmo)
+        self._results['mo_coefficients'] = _mod.job_get_mo_coefficients(
+            nbasis * nmo).reshape(nbasis, nmo).copy()
+        self._results['overlap_matrix'] = _mod.job_get_overlap(
+            nbasis * nbasis).reshape(nbasis, nbasis).copy()
+        self._results['ao_labels'] = _ao_labels(self._results['atomic_numbers'],
+                                                *_mod.job_get_ao_info(nbasis))
         if _mod.job_has_beta:
             r, n = _mod.job_get_beta_mo_energies()
             self._results['beta_mo_energies'] = r[:n].copy()
             r, nr, nc = _mod.job_get_beta_density_matrix()
             self._results['beta_density_matrix'] = r[:nr * nc].reshape(nr, nc).copy()
+            self._results['beta_mo_coefficients'] = _mod.job_get_beta_mo_coefficients(
+                nbasis * nmo).reshape(nbasis, nmo).copy()
+            self._results['mo_occupations'] = _occupations(nmo, int(_mod.job_nelec_alpha), 1.0)
+            self._results['beta_mo_occupations'] = _occupations(nmo, int(_mod.job_nelec_beta), 1.0)
+        else:
+            self._results['mo_occupations'] = _occupations(nmo, int(_mod.job_nelec_alpha), 2.0)
         if _mod.job_has_dipole:
             self._results['dipole'] = _mod.job_dipole.copy()   # (3,) Debye
+        if _mod.job_has_trajectory:
+            nsteps = int(_mod.job_trajectory_nsteps)
+            natoms = int(_mod.job_trajectory_natoms)
+            self._results['trajectory_energies'] = _mod.job_get_trajectory_energies(nsteps).copy()
+            self._results['trajectory_coordinates'] = _mod.job_get_trajectory_coordinates(
+                nsteps * natoms * 3).reshape(nsteps, natoms, 3).copy()
+        if _mod.job_has_ptchg_gradient:
+            g, n = _mod.job_get_point_charge_gradient()
+            self._results['point_charge_gradient'] = g[:3 * n].reshape(n, 3).copy()
         if _mod.job_has_gradient:
             g, n = _mod.job_get_gradients()
             self._results['gradient'] = g[:3 * n].reshape(n, 3).copy()
@@ -602,6 +627,25 @@ def _count_atoms(geometry):
     return sum(1 for line in str(geometry).splitlines() if len(line.split()) >= 4)
 
 
+def _occupations(nmo, noccupied, value):
+    """Occupation numbers of *nmo* orbitals: the first *noccupied* hold *value*."""
+    occupations = _np.zeros(nmo)
+    occupations[:noccupied] = value
+    return occupations
+
+
+def _ao_labels(atomic_numbers, centers, powers):
+    """(atom index, element, function) for each AO, e.g. ``(0, 'O', 'px')``."""
+    labels = []
+    for center, (lx, ly, lz) in zip(centers, powers.reshape(-1, 3)):
+        atom = int(center) - 1
+        function = 'spdfghi'[lx + ly + lz]
+        if lx + ly + lz > 0:
+            function += 'x' * lx + 'y' * ly + 'z' * lz
+        labels.append((atom, _ELEMENTS[int(atomic_numbers[atom]) - 1], function))
+    return labels
+
+
 def _check_point_charges(point_charges):
     """Validate *point_charges*; return an ``(n, 4)`` float array, or None.
 
@@ -625,7 +669,8 @@ def _check_point_charges(point_charges):
 # The energy breakdown is ALWAYS returned (every job computes it), so it is not
 # a "property" the caller opts into.
 _ENERGY_ATTRS = ('total_energy', 'nuclear_repulsion', 'e_electronic',
-                 'e_one_electron', 'e_two_electron', 'e_xc')
+                 'e_one_electron', 'e_two_electron', 'e_xc',
+                 'e_kinetic', 'e_nuclear_attraction')
 
 # Opt-in extras the caller selects via `properties`.  These cost extra work
 # beyond the SCF (they need the DIPOLE keyword), so they are not returned unless
@@ -645,6 +690,12 @@ _ALWAYS_ON_PROPERTIES = {
     'density_matrix',    # total (restricted) or alpha (unrestricted) density
     'beta_mo_energies',      # unrestricted runs only
     'beta_density_matrix',   # unrestricted runs only
+    'mo_coefficients',
+    'mo_occupations',
+    'overlap_matrix',
+    'ao_labels',
+    'beta_mo_coefficients',  # unrestricted runs only
+    'beta_mo_occupations',   # unrestricted runs only
 }
 
 # These are all computed inside QUICK's `dipole` routine, which only runs when
@@ -905,8 +956,11 @@ class PyQuick:
         cycles?), and the energy breakdown **of the optimized structure**.
         ``coordinates`` still holds the geometry you passed in.
 
-        *max_cycles* caps the optimization; the default (``None``) runs to
-        convergence with no cap, which is QUICK's own behaviour.
+        *max_cycles* caps the optimization; the default (``None``) is 2000 steps.
+
+        The Result also carries the path: ``trajectory_energies`` and
+        ``trajectory_coordinates``, one entry per step from the input geometry to
+        the final one.
 
         The optimizer is QUICK's default (DL-Find) unless you add the Cartesian
         optimizer via ``keywords={'LOPT': None}``.  DL-Find does not support
@@ -980,6 +1034,10 @@ class PyQuick:
         return self._engine.input_string
 
 
+_BETA_ONLY = ("exists only for unrestricted (open-shell) runs; on a restricted run "
+              "alpha and beta are identical")
+
+
 class Result:
     """Results of a completed :class:`PyQuick` run.
 
@@ -1015,7 +1073,11 @@ class Result:
         values['coordinates'] = job._results['coordinates']
         for key in ('mulliken', 'lowdin', 'esp_charges', 'mo_energies', 'density_matrix',
                     'beta_mo_energies', 'beta_density_matrix',
-                    'dipole', 'gradient', 'optimized_coordinates', 'converged'):
+                    'mo_coefficients', 'mo_occupations', 'overlap_matrix', 'ao_labels',
+                    'beta_mo_coefficients', 'beta_mo_occupations',
+                    'dipole', 'gradient', 'point_charge_gradient',
+                    'optimized_coordinates', 'converged',
+                    'trajectory_energies', 'trajectory_coordinates'):
             if key in job._results:
                 values[key] = job._results[key]
         metadata = {
@@ -1065,8 +1127,22 @@ class Result:
 
     @property
     def e_one_electron(self):
-        """One-electron energy (kinetic + nuclear-electron attraction) in Hartree."""
+        """One-electron energy in Hartree: ``e_kinetic + e_nuclear_attraction``."""
         return self._values['e_one_electron']
+
+    @property
+    def e_kinetic(self):
+        """Electronic kinetic energy ``Tr(P*T)`` in Hartree."""
+        return self._values['e_kinetic']
+
+    @property
+    def e_nuclear_attraction(self):
+        """Attraction of the electrons to the nuclei in Hartree.
+
+        Equals ``e_one_electron - e_kinetic`` exactly.  With ``point_charges`` it
+        also holds the electrons' attraction to those charges.
+        """
+        return self._values['e_nuclear_attraction']
 
     @property
     def e_two_electron(self):
@@ -1152,6 +1228,49 @@ class Result:
             raise AttributeError("'beta_density_matrix' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
         return self._values['beta_density_matrix']
 
+    @property
+    def mo_coefficients(self):
+        """AO -> MO coefficients, numpy array of shape (nbasis, nmo); columns are MOs.
+
+        The alpha orbitals on unrestricted runs, ordered as :attr:`mo_energies`,
+        with rows ordered as :attr:`ao_labels`.  Orbital signs are arbitrary.
+        """
+        return self._values['mo_coefficients']
+
+    @property
+    def mo_occupations(self):
+        """Occupation of each MO, shape (nmo,): 2/0 on restricted runs, else 1/0."""
+        return self._values['mo_occupations']
+
+    @property
+    def overlap_matrix(self):
+        """AO overlap matrix, numpy array of shape (nbasis, nbasis)."""
+        return self._values['overlap_matrix']
+
+    @property
+    def ao_labels(self):
+        """(atom index, element, function) for each AO, e.g. ``(0, 'O', 'px')``.
+
+        Atom indices count from 0.  Functions are Cartesian (six d, ten f):
+        ``'s'``, ``'px'``, ``'dxy'``, ...  This is the row order of
+        :attr:`mo_coefficients` and of the density and overlap matrices.
+        """
+        return self._values['ao_labels']
+
+    @property
+    def beta_mo_coefficients(self):
+        """Beta AO -> MO coefficients, shape (nbasis, nmo); unrestricted runs only."""
+        if 'beta_mo_coefficients' not in self._values:
+            raise AttributeError("'beta_mo_coefficients' %s" % _BETA_ONLY)
+        return self._values['beta_mo_coefficients']
+
+    @property
+    def beta_mo_occupations(self):
+        """Occupation of each beta MO, shape (nmo,); unrestricted runs only."""
+        if 'beta_mo_occupations' not in self._values:
+            raise AttributeError("'beta_mo_occupations' %s" % _BETA_ONLY)
+        return self._values['beta_mo_occupations']
+
     # -- opt-in arrays (need the DIPOLE keyword) -----------------------------
     @property
     def mulliken(self):
@@ -1190,7 +1309,52 @@ class Result:
                 "use calc.get_grad(geometry) to compute the nuclear gradient")
         return self._values['gradient']
 
+    @property
+    def point_charge_gradient(self):
+        """Gradient on the external point charges, shape (ncharges, 3), Hartree/Bohr.
+
+        dE/dR of each charge from :meth:`PyQuick.get_grad` with ``point_charges``
+        (or ``job.run(geometry, gradient=True)``).  Like ``total_energy`` it leaves
+        out the repulsion among the charges themselves.
+        """
+        if 'point_charge_gradient' not in self._values:
+            if 'e_external_charge' not in self._values:
+                raise AttributeError(
+                    "'point_charge_gradient' is unavailable: this run had no "
+                    "point_charges")
+            raise AttributeError(
+                "'point_charge_gradient' is unavailable: this run computed no "
+                "gradient — use calc.get_grad(geometry, point_charges=...)")
+        return self._values['point_charge_gradient']
+
     # -- optimization (produced by geo_opt) ----------------------------------
+    @property
+    def trajectory_energies(self):
+        """Energy of each optimization step, shape (nsteps,), Hartree.
+
+        Entry 0 is the input geometry, the last is the final one.  Only present on
+        a Result from :meth:`PyQuick.geo_opt`.  QUICK records ``Eel + Ecore`` per
+        step, so these energies leave out any dispersion correction.
+        """
+        if 'trajectory_energies' not in self._values:
+            raise AttributeError(
+                "'trajectory_energies' is unavailable: only geo_opt() produces a "
+                "trajectory")
+        return self._values['trajectory_energies']
+
+    @property
+    def trajectory_coordinates(self):
+        """Geometry of each optimization step, shape (nsteps, natom, 3), Angstrom.
+
+        Entry 0 is the input geometry, the last is the final one.  Only present on
+        a Result from :meth:`PyQuick.geo_opt`.
+        """
+        if 'trajectory_coordinates' not in self._values:
+            raise AttributeError(
+                "'trajectory_coordinates' is unavailable: only geo_opt() produces a "
+                "trajectory")
+        return self._values['trajectory_coordinates']
+
     @property
     def optimized_coordinates(self):
         """Optimized atomic coordinates in Angstrom, shape (natom, 3).

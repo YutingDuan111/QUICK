@@ -6,13 +6,19 @@ module pyquick
     use quick_calculated_module, only : quick_qm_struct
     use quick_method_module, only : quick_method
     use quick_files_module, only : iOutFile, outFileName, inFileName, isTemplate, &
-                                   set_quick_files, print_quick_io_file
+                                   set_quick_files, print_quick_io_file, &
+                                   write_molden, iMoldenFile
+    use quick_molden_module, only : quick_molden
     use quick_api_module, only : quick_api
     use quick_constants_module, only : SYMBOL, SYMBOL_MAX, A_TO_BOHRS
-    use quick_basis_module, only : nbasis, NBSuse
+    use quick_basis_module, only : nbasis, NBSuse, quick_basis, itype
+#ifdef MPIV
+    use quick_basis_module, only : mpi_jshell, mpi_nbasis
+#endif
     use quick_cutoff_module, only : schwarzoff
     use quick_eri_cshell_module, only : getEriPrecomputables
     use quick_sad_guess_module, only : getSadGuess
+    use quick_oei_module, only : kineticO
     use quick_gridpoints_module, only : quick_dft_grid, deform_dft_grid
     use quick_grad_cshell_module, only : cshell_gradient
     use quick_grad_oshell_module, only : oshell_gradient
@@ -32,13 +38,19 @@ module pyquick
               job_open, job_step, job_close, &
               job_active, &
               job_total_energy, job_e_core, job_e_electronic, &
-              job_e_1e, job_e_xc, job_e_disp, job_e_charge, &
+              job_e_1e, job_e_kinetic, job_e_xc, job_e_disp, job_e_charge, &
               job_dipole, job_has_dipole, &
               job_has_dispersion, job_has_extcharge, job_has_gradient, &
               job_has_mulliken, job_has_lowdin, job_has_mo_energies, job_has_density_matrix, &
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
               job_get_gradients, job_get_geometry, job_exception_message, &
               job_has_esp, job_get_esp_charges, &
+              job_has_ptchg_gradient, job_get_point_charge_gradient, &
+              job_nbasis, job_nmo, job_nelec_alpha, job_nelec_beta, &
+              job_get_mo_coefficients, job_get_beta_mo_coefficients, &
+              job_get_overlap, job_get_ao_info, &
+              job_has_trajectory, job_trajectory_nsteps, job_trajectory_natoms, &
+              job_get_trajectory_energies, job_get_trajectory_coordinates, &
               job_has_beta, job_get_beta_mo_energies, job_get_beta_density_matrix, &
               job_has_optimized, job_opt_converged, job_get_optimized_geometry, &
               set_mpi, get_build_info
@@ -92,6 +104,7 @@ module pyquick
     double precision :: job_e_core         = 0.0d0
     double precision :: job_e_electronic   = 0.0d0
     double precision :: job_e_1e           = 0.0d0
+    double precision :: job_e_kinetic      = 0.0d0
     double precision :: job_e_xc           = 0.0d0
     double precision :: job_e_disp         = 0.0d0
     double precision :: job_e_charge       = 0.0d0   ! ECharge; never part of ETot
@@ -106,6 +119,24 @@ module pyquick
 
     ! whether a nuclear gradient was computed for the last run
     logical :: job_has_gradient = .false.
+    logical :: job_has_ptchg_gradient = .false.
+
+    ! sizes for the MO, overlap and AO getters, set by harvest_results.
+    ! job_nelec_alpha is the number of doubly occupied MOs on a restricted run.
+    integer :: job_nbasis = 0
+    integer :: job_nmo = 0
+    integer :: job_nelec_alpha = 0
+    integer :: job_nelec_beta = 0
+
+    ! optimization trajectory, copied out of QUICK's Molden storage (see
+    ! trajectory_begin). DEFAULT_OPT_CYCLES caps a geo_opt with no max_cycles: the
+    ! storage needs a known size, and QUICK's optimizers do not check it.
+    integer, parameter :: DEFAULT_OPT_CYCLES = 2000
+    logical :: job_has_trajectory = .false.
+    integer :: job_trajectory_nsteps = 0
+    integer :: job_trajectory_natoms = 0
+    double precision, allocatable :: traj_coords(:,:,:)   ! (3, natom, nsteps), Angstrom
+    double precision, allocatable :: traj_energies(:)     ! (nsteps), Hartree
 
     ! geometry optimization: whether the last run was an OPT job, and whether it
     ! reached convergence (as opposed to stopping at the cycle limit)
@@ -363,8 +394,7 @@ contains
         !          2 = geometry optimization
         ! do_log:  1 = write QUICK's log to <output_stem>.out (default behaviour),
         !          0 = send it to the platform null device, leaving no file.
-        ! max_cycles: for jobtype 2 only -- <= 0 emits a bare OPTIMIZE keyword
-        !          (QUICK's default: run to convergence, no cap); > 0 emits
+        ! max_cycles: for jobtype 2 only -- <= 0 uses DEFAULT_OPT_CYCLES; > 0 emits
         !          OPTIMIZE=<n> to cap the number of optimization cycles.
 #if defined(GPU) || defined(MPIV_GPU)
         ! GPU builds only: allmod exposes the gpu_* device routines and the basis
@@ -389,6 +419,7 @@ contains
         logical :: new_type
 
         ierr = 0
+        job_has_trajectory = .false.
 
         ! --- decide the log open mode before finalize clears job_active ---
         ! first run replaces the file; re-runs append to it
@@ -431,17 +462,17 @@ contains
         ! quick_method%grad before getMol allocates quick_qm_struct%gradient
         if (jobtype == 1) keyword_line = trim(keyword_line) // ' GRADIENT'
 
-        ! for an optimization, OPTIMIZE sets quick_method%opt (and %grad). A bare
-        ! keyword leaves iopt=0, which QUICK treats as "no cap, run to
-        ! convergence"; OPTIMIZE=<n> caps the cycles. The optimizer is QUICK's
-        ! default (DL-Find) unless the user added the LOPT keyword (Cartesian).
+        ! for an optimization, OPTIMIZE sets quick_method%opt (and %grad). The cycle
+        ! cap is always explicit: it sizes the trajectory storage (a bare OPTIMIZE
+        ! would leave iopt=0). The optimizer is QUICK's default (DL-Find) unless the
+        ! user added the LOPT keyword (Cartesian).
         if (jobtype == 2) then
             if (max_cycles > 0) then
                 write(cyc_str, '(I0)') max_cycles
-                keyword_line = trim(keyword_line) // ' OPTIMIZE=' // trim(cyc_str)
             else
-                keyword_line = trim(keyword_line) // ' OPTIMIZE'
+                write(cyc_str, '(I0)') DEFAULT_OPT_CYCLES
             end if
+            keyword_line = trim(keyword_line) // ' OPTIMIZE=' // trim(cyc_str)
         end if
 
         ! --- guard against silent Fortran truncation on assignment to quick_api%Keywd ---
@@ -468,6 +499,7 @@ contains
             call fail('job_run: initialize1 failed')
             return
         end if
+        call reset_engine_state()
 
         ! --- QUICK's diagnostic log: rank 0 only, as in main.f90. MPI worker
         ! ranks get the null device, so a stray write never creates a file ---
@@ -611,10 +643,13 @@ contains
                               '(add the LOPT keyword)')
                     return
                 end if
+                call trajectory_begin()
                 call dl_find(ierr, master)
             else
+                call trajectory_begin()
                 call lopt(ierr)
             end if
+            call trajectory_end()
             if (ierr /= 0) then
                 call fail('job_run: geometry optimization failed')
                 return
@@ -682,6 +717,7 @@ contains
         logical :: new_type
 
         ierr = 0
+        job_has_trajectory = .false.
         if (job_open_flag) then
             call fail('job_open: a job is already open; call job_close first')
             return
@@ -708,6 +744,7 @@ contains
         engine_running = .true.
         call initialize1(ierr)
         if (ierr /= 0) then; call fail('job_open: initialize1 failed'); return; end if
+        call reset_engine_state()
 
         ! log on rank 0 only; MPI workers write to the null device (see job_run)
         if (master) then
@@ -917,6 +954,10 @@ contains
 
     subroutine harvest_results(did_gradient)
         ! Copy energies/properties out of QUICK's module state after a run.
+#ifdef MPIV
+        use mpi
+        integer :: ierr_mpi
+#endif
         external :: dipole
         logical, intent(in) :: did_gradient
 
@@ -926,7 +967,14 @@ contains
         job_e_core         = quick_qm_struct%ECore
         job_e_electronic   = quick_qm_struct%EEl
         job_e_1e           = quick_qm_struct%E1e
+#ifdef MPIV
+        ! under MPI each rank builds part of the one-electron matrix, so its E1e is
+        ! partial. QUICK reduces Eel but not E1e; rank 0 needs the sum.
+        call MPI_Reduce(quick_qm_struct%E1e, job_e_1e, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
+                        0, MPI_COMM_WORLD, ierr_mpi)
+#endif
         job_e_xc           = quick_qm_struct%Exc
+        if (master) call compute_kinetic_energy()
         job_e_disp         = quick_qm_struct%Edisp
         job_e_charge       = quick_qm_struct%ECharge
         job_has_dispersion = quick_method%edisp
@@ -945,6 +993,17 @@ contains
         job_has_beta           = quick_method%unrst .and. allocated(quick_qm_struct%Eb) &
                                  .and. allocated(quick_qm_struct%denseb)
         job_has_gradient       = did_gradient .and. allocated(quick_qm_struct%gradient)
+        job_nbasis = nbasis
+        job_nmo    = NBSuse
+        if (quick_method%unrst) then
+            job_nelec_alpha = quick_molspec%nElec
+            job_nelec_beta  = quick_molspec%nElecb
+        else
+            job_nelec_alpha = quick_molspec%nElec / 2
+            job_nelec_beta  = 0
+        end if
+        job_has_ptchg_gradient = did_gradient .and. quick_molspec%nextatom > 0 .and. &
+                                 allocated(quick_qm_struct%ptchg_gradient)
 
         job_has_optimized = quick_method%opt
         job_opt_converged = quick_qm_struct%opt_converged
@@ -1128,6 +1187,177 @@ contains
             end do
         end do
     end subroutine job_get_beta_density_matrix
+
+    subroutine compute_kinetic_energy()
+        ! E_kinetic = Tr(P*T). QUICK keeps only T + V (oneElecO), so rebuild T with
+        ! its own kineticO. That routine writes the lower triangle of the Fock array
+        ! o, which later persistent-job steps still need, so save and restore it.
+        double precision, allocatable :: saved_o(:,:)
+        double precision :: p
+        integer :: i, j
+
+        saved_o = quick_qm_struct%o
+        quick_qm_struct%o = 0.0d0
+        do i = 1, nbasis
+            call kineticO(i)
+        end do
+        job_e_kinetic = 0.0d0
+        do i = 1, nbasis
+            do j = i, nbasis
+                p = quick_qm_struct%dense(j, i)
+                if (quick_method%unrst) p = p + quick_qm_struct%denseb(j, i)
+                if (j /= i) p = 2.0d0 * p
+                job_e_kinetic = job_e_kinetic + p * quick_qm_struct%o(j, i)
+            end do
+        end do
+        quick_qm_struct%o = saved_o
+    end subroutine compute_kinetic_energy
+
+    subroutine reset_engine_state()
+        ! State that outlives a calculation in QUICK, which normally runs one per
+        ! process, and that initialize1 and finalize leave alone. Without this, after
+        ! a LOPT run every later optimization stays on LOPT; and under MPI basis.f90
+        ! allocates its load-balancing tables once, sized by the first molecule, so
+        ! a later larger molecule overruns them.
+        quick_method%usedlfind = .true.
+#ifdef MPIV
+        if (allocated(mpi_jshell)) deallocate(mpi_jshell)
+        if (allocated(mpi_nbasis)) deallocate(mpi_nbasis)
+#endif
+    end subroutine reset_engine_state
+
+    subroutine trajectory_begin()
+        ! Both optimizers and the SCF record each step in quick_molden when
+        ! write_molden is on, so the trajectory needs no QUICK source change. Do
+        ! what initialize_molden does, minus its two problems for pyquick: it sizes
+        ! the arrays from iopt and iscf without margin (nscf_snapshots even by the
+        ! SCF limit, not the step count), and it opens a real .molden file. UHF also
+        ! writes MOs to that unit, so give it an unnamed scratch file (the null device
+        ! may already be the log, and gfortran refuses it on a second unit). Done on
+        ! every rank: workers reach some of the same code.
+        integer :: nsnap, ios
+
+        job_trajectory_nsteps = 0
+        nsnap = quick_method%iopt + 2
+        call trajectory_free_storage()
+        allocate(quick_molden%nscf_snapshots(nsnap))
+        allocate(quick_molden%e_snapshots(quick_method%iscf + 2, nsnap))
+        allocate(quick_molden%xyz_snapshots(3, natom, nsnap))
+        quick_molden%nscf_snapshots = 0
+        quick_molden%e_snapshots    = 0.0d0
+        quick_molden%natom            = natom
+        quick_molden%opt              = .true.
+        quick_molden%iexport_snapshot = 1
+        quick_molden%iMoldenFile      = iMoldenFile
+        open(unit=iMoldenFile, status='SCRATCH', form='FORMATTED', iostat=ios)
+        if (ios /= 0) call fail('geo_opt: could not open a scratch file')
+        write_molden = .true.
+    end subroutine trajectory_begin
+
+    subroutine trajectory_end()
+        ! Copy the steps out and stop the Molden path, so finalize leaves it alone.
+        integer :: i, n
+
+        write_molden = .false.
+        close(iMoldenFile)
+        if (allocated(traj_coords))   deallocate(traj_coords)
+        if (allocated(traj_energies)) deallocate(traj_energies)
+        if (master) then
+            n = min(quick_molden%iexport_snapshot - 1, size(quick_molden%nscf_snapshots))
+            allocate(traj_coords(3, natom, n), traj_energies(n))
+            do i = 1, n
+                traj_coords(:, :, i) = quick_molden%xyz_snapshots(:, :, i) / A_TO_BOHRS
+                traj_energies(i) = quick_molden%e_snapshots(quick_molden%nscf_snapshots(i), i)
+            end do
+            job_trajectory_nsteps = n
+            job_trajectory_natoms = natom
+            job_has_trajectory    = n > 0
+        end if
+        call trajectory_free_storage()
+    end subroutine trajectory_end
+
+    subroutine trajectory_free_storage()
+        ! reord_mo_vec is QUICK's, sized by nbasis once: free it for the next molecule
+        if (allocated(quick_molden%nscf_snapshots)) deallocate(quick_molden%nscf_snapshots)
+        if (allocated(quick_molden%e_snapshots))    deallocate(quick_molden%e_snapshots)
+        if (allocated(quick_molden%xyz_snapshots))  deallocate(quick_molden%xyz_snapshots)
+        if (allocated(quick_molden%reord_mo_vec))   deallocate(quick_molden%reord_mo_vec)
+    end subroutine trajectory_free_storage
+
+    subroutine job_get_trajectory_energies(energies, n)
+        ! Energy of each optimization step (Eel + Ecore, as QUICK records it).
+        integer, intent(in) :: n
+        double precision, intent(out) :: energies(n)
+        energies = traj_energies(1:n)
+    end subroutine job_get_trajectory_energies
+
+    subroutine job_get_trajectory_coordinates(coords, n)
+        ! Flat, row-major (step, atom, xyz) in Angstrom, n = nsteps*natoms*3.
+        ! Reshape in Python: coords.reshape(nsteps, natoms, 3).
+        integer, intent(in) :: n
+        double precision, intent(out) :: coords(n)
+        integer :: i, j, k, idx
+        idx = 0
+        do k = 1, job_trajectory_nsteps
+            do i = 1, job_trajectory_natoms
+                do j = 1, 3
+                    idx = idx + 1
+                    coords(idx) = traj_coords(j, i, k)
+                end do
+            end do
+        end do
+    end subroutine job_get_trajectory_coordinates
+
+    subroutine job_get_mo_coefficients(c, n)
+        ! AO -> MO coefficients, flat and row-major, n = nbasis*nmo.
+        ! Reshape in Python: c.reshape(nbasis, nmo); columns are MOs.
+        integer, intent(in) :: n
+        double precision, intent(out) :: c(n)
+        c = reshape(transpose(quick_qm_struct%co(1:nbasis, 1:NBSuse)), [n])
+    end subroutine job_get_mo_coefficients
+
+    subroutine job_get_beta_mo_coefficients(c, n)
+        ! As job_get_mo_coefficients, for the beta orbitals of an unrestricted run.
+        integer, intent(in) :: n
+        double precision, intent(out) :: c(n)
+        c = reshape(transpose(quick_qm_struct%cob(1:nbasis, 1:NBSuse)), [n])
+    end subroutine job_get_beta_mo_coefficients
+
+    subroutine job_get_overlap(s, n)
+        ! AO overlap matrix, flat, n = nbasis*nbasis (symmetric, so order is free).
+        integer, intent(in) :: n
+        double precision, intent(out) :: s(n)
+        s = reshape(quick_qm_struct%s(1:nbasis, 1:nbasis), [n])
+    end subroutine job_get_overlap
+
+    subroutine job_get_ao_info(centers, powers, n)
+        ! For each of the n = nbasis AOs: its atom (1-based) and the Cartesian
+        ! powers (lx, ly, lz) of its function, flat as (lx1,ly1,lz1, lx2,...).
+        integer, intent(in) :: n
+        integer, intent(out) :: centers(n), powers(3 * n)
+        integer :: i
+        do i = 1, n
+            centers(i) = quick_basis%ncenter(i)
+            powers(3 * i - 2:3 * i) = itype(1:3, i)
+        end do
+    end subroutine job_get_ao_info
+
+    subroutine job_get_point_charge_gradient(g, n)
+        ! Gradient on the external point charges, flat and row-major per charge:
+        ! (dx1,dy1,dz1, dx2,...), length 3*n, Hartree/Bohr. Reshape: g[:3*n].reshape(n, 3).
+        !f2py intent(out) g, n
+        integer, intent(out) :: n
+        double precision, intent(out) :: g(300000)
+        g = 0.0d0
+        n = 0
+        if (.not. job_has_ptchg_gradient) then
+            call fail("the point-charge gradient was not computed; " // &
+                      "use get_grad() with point_charges")
+            return
+        end if
+        n = quick_molspec%nextatom
+        g(1:3*n) = quick_qm_struct%ptchg_gradient(1:3*n)
+    end subroutine job_get_point_charge_gradient
 
     subroutine job_get_gradients(g, n)
         ! Returns the nuclear gradient as a flat, row-major (per-atom) array of
