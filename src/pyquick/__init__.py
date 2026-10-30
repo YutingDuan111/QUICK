@@ -557,11 +557,11 @@ _NEEDS_DIPOLE = {'mulliken_charges', 'lowdin_charges', 'dipole'}
 _JOBTYPE_WORDS = {'energy', 'gradient', 'gradients', 'forces',
                   'optimize', 'optimized_coords', 'optimized_coordinates', 'geo_opt'}
 
-# Extras planned for later phases — reported with a clearer message than
-# "unknown property" so callers know they exist but aren't wired up yet.
-_DEFERRED_PROPERTIES = {
-    'mp2': 'Phase 3',
-    'e_mp2': 'Phase 3',
+# Quantities QUICK can compute that pyquick deliberately does not expose --
+# reported with a clearer message than "unknown property".
+_UNSUPPORTED_PROPERTIES = {
+    'mp2',     # MP2 energy: not part of pyquick (decided 2026-10-19)
+    'e_mp2',
 }
 
 # opt-in property name -> Result attributes it unlocks.  The conditional energies
@@ -710,10 +710,9 @@ class PyQuick:
                     f"{p!r} is not a property — the job type is chosen by the "
                     f"method you call: get_energy(), get_grad(), or geo_opt(). "
                     f"`properties` selects only extras: {sorted(_SUPPORTED_PROPERTIES)}")
-            if p in _DEFERRED_PROPERTIES:
+            if p in _UNSUPPORTED_PROPERTIES:
                 raise ValueError(
-                    f"property {p!r} is not available in this version "
-                    f"(planned for {_DEFERRED_PROPERTIES[p]}); "
+                    f"property {p!r} is not supported by pyquick; "
                     f"supported: {sorted(_SUPPORTED_PROPERTIES)}")
             raise ValueError(
                 f"unknown property {p!r}; supported: {sorted(_SUPPORTED_PROPERTIES)}")

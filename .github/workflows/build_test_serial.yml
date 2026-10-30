@@ -188,7 +188,7 @@ jobs:
             hdf5-install: 'libhdf5-dev'
             hdf5-restart-support: TRUE
             python-version: '3.10'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-22.04'
             compiler-type: 'GNU'
             compiler-version: '11'
@@ -199,7 +199,7 @@ jobs:
             hdf5-install: 'libhdf5-dev'
             hdf5-restart-support: TRUE
             python-version: '3.11'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-24.04'
             compiler-type: 'GNU'
             compiler-version: '12'
@@ -243,7 +243,7 @@ jobs:
             hdf5-install: ''
             hdf5-restart-support: FALSE
             python-version: '3.11'
-            numpy-version: '1.26'
+            numpy-version: '2.0'
           - os: 'ubuntu-24.04'
             compiler-type: 'CLANG'
             compiler-version: '18'
@@ -526,10 +526,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: 'Install numpy for pyquick build'
+      - name: 'Install numpy and pytest for pyquick'
         if: matrix.python-version
         run: |
-          python3 -m pip install "numpy==${{ matrix.numpy-version }}.*" meson ninja
+          python3 -m pip install "numpy==${{ matrix.numpy-version }}.*" meson ninja pytest
       - name: 'Build and install pyquick Python extension'
         if: matrix.python-version
         run: |
@@ -548,6 +548,7 @@ jobs:
             export DYLD_LIBRARY_PATH=$PWD/install/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}
           fi
           python3 src/pyquick/test/pyquick_ene_H2O_rhf_sto3g.py
+          python3 -m pytest src/pyquick/test/test_pyquick_api.py -q -p no:cacheprovider
       - name: 'Run Tests for Serial Version'
         run: |
           if [ ${{ matrix.compiler-type }} == 'INTELLLVM' ]; then

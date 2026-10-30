@@ -7,8 +7,8 @@ HF/STO-3G water job.
 
 Job type is chosen by which method you call:
     calc.get_energy(geometry)  -> single-point energy
-    calc.get_grad(geometry)    -> energy + forces        (Phase 2, not yet implemented)
-    calc.geo_opt(geometry)     -> optimized geometry      (Phase 2, not yet implemented)
+    calc.get_grad(geometry)    -> energy + forces
+    calc.geo_opt(geometry)     -> optimized geometry
 `properties` selects only optional extras (charges, MO energies, density matrix).
 """
 
@@ -58,10 +58,15 @@ def test_jobtype_as_property_is_rejected():
             pyquick.PyQuick(method='HF', basis='STO-3G', properties=[bad])
 
 
-def test_deferred_property_reports_phase():
+@pytest.mark.parametrize("prop", ['mp2', 'e_mp2', 'MP2'])
+def test_mp2_property_not_supported(prop):
+    """MP2 is deliberately not part of pyquick: a plain 'not supported' error,
+    with no promise of a later phase."""
     with pytest.raises(ValueError) as excinfo:
-        pyquick.PyQuick(method='HF', basis='STO-3G', properties=['mp2'])
-    assert 'Phase 3' in str(excinfo.value)
+        pyquick.PyQuick(method='HF', basis='STO-3G', properties=[prop])
+    message = str(excinfo.value)
+    assert 'not supported' in message
+    assert 'Phase' not in message and 'planned' not in message
 
 
 def test_dipole_is_a_supported_property():
@@ -870,3 +875,33 @@ def test_density_matrix_meaning_documented():
     assert np.allclose(rhf.density_matrix, 2 * uhf.density_matrix, atol=1e-7)
     doc = pyquick.Result.density_matrix.__doc__.lower()
     assert 'total' in doc and 'alpha' in doc and 'unrestricted' in doc
+
+
+# ---------------------------------------------------------------------------
+# Persistent DFT job with a moving geometry
+#
+# The DFT grid depends on the geometry.  job_step must free the previous
+# step's grid before a new one is built (as QUICK's own API does between MD
+# steps); without that the GPU build corrupted the heap once the grid size
+# changed, crashing on job close.  The CPU build happened to survive, so on
+# CPU this guards the energies; on a GPU build it also guards the crash.
+# ---------------------------------------------------------------------------
+
+WATER_STRETCHED = """
+    O  -0.33840   0.00380   0.23923
+    H  -0.33508  -0.00193  -0.83813
+    H   0.67856  -0.00193   0.59530
+"""
+
+
+def test_persistent_dft_job_with_moving_geometry():
+    calc = pyquick.PyQuick('B3LYP', 'STO-3G', keywords=LOOSE, log=False)
+    geometries = [WATER, WATER_STRETCHED, WATER, WATER_STRETCHED]
+    with calc.new_job(WATER) as job:
+        steps = [job.run(g, gradient=(k == 3)) for k, g in enumerate(geometries)]
+    # each step matches a one-shot run at the same geometry (also proves the
+    # process survived closing the job)
+    ref = {g: calc.get_energy(g).total_energy for g in (WATER, WATER_STRETCHED)}
+    for g, r in zip(geometries, steps):
+        assert r.total_energy == pytest.approx(ref[g], abs=TOL)
+    assert steps[3].gradient.shape == (3, 3)

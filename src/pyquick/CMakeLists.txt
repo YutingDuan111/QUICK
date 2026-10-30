@@ -32,14 +32,29 @@ message(STATUS "pyquick: using Python interpreter: ${Python3_EXECUTABLE}")
 # 2. Verify numpy and f2py are available via the located interpreter
 # ---------------------------------------------------------------------------
 execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+    COMMAND ${Python3_EXECUTABLE} -c "import numpy; print(numpy.__version__)"
     RESULT_VARIABLE _numpy_result
-    OUTPUT_QUIET ERROR_QUIET)
+    OUTPUT_VARIABLE _numpy_version
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
 if(NOT _numpy_result EQUAL 0)
     message(FATAL_ERROR
         "numpy not importable by ${Python3_EXECUTABLE}. "
         "Install numpy or reconfigure without -DPYTHON=TRUE.")
 endif()
+
+# numpy < 2.0: f2py's meson backend silently drops --f90flags, so -cpp (and
+# -DGPU) never reach the compiler. The #if defined(GPU) blocks in pyquick.f90
+# then compile into a CPU build and the extension fails to import with
+# undefined gpu_* symbols (or, for a GPU build, the GPU code is left out).
+if(_numpy_version VERSION_LESS 2.0)
+    message(FATAL_ERROR
+        "pyquick requires numpy >= 2.0, but ${Python3_EXECUTABLE} has numpy "
+        "${_numpy_version}: older f2py drops the --f90flags pyquick needs. "
+        "Upgrade numpy (python -m pip install \"numpy>=2.0\") or reconfigure "
+        "without -DPYTHON=TRUE.")
+endif()
+message(STATUS "pyquick: using numpy ${_numpy_version}")
 
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -m numpy.f2py -h
