@@ -91,7 +91,8 @@ execute_process(
 set(_PYQUICK_SO "${CMAKE_CURRENT_BINARY_DIR}/_pyquick${PYTHON_EXT_SUFFIX}")
 
 # ---------------------------------------------------------------------------
-# 4. Select the libquick flavour to bind against: serial (CPU) or GPU.
+# 4. Select the libquick flavour to bind against: GPU + MPI (one GPU per
+#    rank), GPU, MPI (CPU) or serial (CPU), in that order of precedence.
 #
 #    pyquick.f90 carries GPU code inside #if defined(GPU) guards (mirroring
 #    main.f90). The GPU macro is what src/CMakeLists.txt defines on
@@ -112,14 +113,8 @@ set(_PYQUICK_SO "${CMAKE_CURRENT_BINARY_DIR}/_pyquick${PYTHON_EXT_SUFFIX}")
 set(_PYQUICK_F90FLAGS "-cpp -I${CMAKE_SOURCE_DIR}/src/util")
 set(_PYQUICK_EXTRA_LINK_ARGS "")
 
-if(CUDA)
-    # CUDA=TRUE covers both backends; HIP=TRUE additionally flips
-    # QUICK_GPU_TARGET_NAME to "hip" and QUICK_GPU_PLATFORM to "HIP".
-    set(_PYQUICK_LIBTARGET libquick_${QUICK_GPU_TARGET_NAME})
-    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/${QUICK_GPU_TARGET_NAME}")
-    set(_PYQUICK_LIBNAME "quick_${QUICK_GPU_TARGET_NAME}")
-    string(APPEND _PYQUICK_F90FLAGS " -DGPU -D${QUICK_GPU_PLATFORM}")
-
+# Link pieces shared by the flavours below.
+macro(_pyquick_add_cuda_link_args)
     if(NOT HIP)
         # libquick_cuda is a shared library, so cublas/cusolver/cudart are
         # normally pulled in transitively. Name them anyway: f2py links with
@@ -135,8 +130,76 @@ if(CUDA)
         list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
         list(APPEND _PYQUICK_EXTRA_LINK_ARGS -lcudart -lcublas -lcusolver)
     endif()
+endmacro()
 
+macro(_pyquick_add_mpi_args)
+    # pyquick.f90's own MPI blocks sit behind #ifdef MPIV and call MPI directly
+    # (use mpi), so the compile needs the MPI Fortran module directory and the
+    # link the MPI Fortran libraries. Python owns MPI through mpi4py (see
+    # __init__.py), so mpi4py must be importable -- and built against this
+    # same MPI library.
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import mpi4py"
+        RESULT_VARIABLE _mpi4py_result
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _mpi4py_result EQUAL 0)
+        message(FATAL_ERROR
+            "pyquick with MPI=TRUE requires mpi4py for ${Python3_EXECUTABLE}, built "
+            "against the same MPI library as QUICK. Install it from source:\n"
+            "    MPICC=<path to mpicc> ${Python3_EXECUTABLE} -m pip install --no-binary=mpi4py mpi4py\n"
+            "or reconfigure with -DPYTHON=FALSE.")
+    endif()
+
+    # FindMPI gives full library paths; f2py's meson backend wants -L/-l.
+    # f2py turns each -l<name> into a meson variable named <name>, so a name
+    # that is not a valid identifier (Open MPI 4's open-rte, open-pal) breaks
+    # meson setup. Those are internal libraries libmpi itself depends on and
+    # loads, so they are left out; the Fortran bindings (mpi_mpifh, ...) and
+    # libmpi are what pyquick.f90 calls.
+    foreach(_mpiinc ${MPI_Fortran_INCLUDE_DIRS} ${MPI_Fortran_MODULE_DIR})
+        list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-I${_mpiinc}")
+    endforeach()
+    foreach(_mpilib ${MPI_Fortran_LIBRARIES})
+        get_filename_component(_mpilibdir "${_mpilib}" DIRECTORY)
+        get_filename_component(_mpilibname "${_mpilib}" NAME_WE)
+        string(REGEX REPLACE "^lib" "" _mpilibname "${_mpilibname}")
+        if(_mpilibname MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+            list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
+endmacro()
+
+# CUDA=TRUE covers both GPU backends; HIP=TRUE additionally flips
+# QUICK_GPU_TARGET_NAME to "hip" and QUICK_GPU_PLATFORM to "HIP".
+if(CUDA AND MPI)
+    # GPU + MPI: one GPU per rank -- QUICK's MPIV_GPU path, as in
+    # quick.cuda.MPI. libquick_mpi_cuda is a copy of libquick_mpi with the GPU
+    # sources, so MPIV holds there too and pyquick's CPU-MPI blocks apply
+    # unchanged; MPIV_GPU adds the per-rank device start-up and the uploads.
+    set(_PYQUICK_LIBTARGET libquick_mpi_${QUICK_GPU_TARGET_NAME})
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/mpi_${QUICK_GPU_TARGET_NAME}")
+    set(_PYQUICK_LIBNAME "quick_mpi_${QUICK_GPU_TARGET_NAME}")
+    string(APPEND _PYQUICK_F90FLAGS " -DMPIV -DMPIV_GPU -D${QUICK_GPU_PLATFORM}_MPIV")
+    _pyquick_add_cuda_link_args()
+    _pyquick_add_mpi_args()
+    message(STATUS "pyquick: binding against multi-GPU MPI libquick (${_PYQUICK_LIBNAME})")
+elseif(CUDA)
+    set(_PYQUICK_LIBTARGET libquick_${QUICK_GPU_TARGET_NAME})
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/${QUICK_GPU_TARGET_NAME}")
+    set(_PYQUICK_LIBNAME "quick_${QUICK_GPU_TARGET_NAME}")
+    string(APPEND _PYQUICK_F90FLAGS " -DGPU -D${QUICK_GPU_PLATFORM}")
+    _pyquick_add_cuda_link_args()
     message(STATUS "pyquick: binding against GPU libquick (${_PYQUICK_LIBNAME})")
+elseif(MPI)
+    # MPI (CPU): bind libquick_mpi, whose MPIV code path QUICK runs across all
+    # ranks of MPI_COMM_WORLD.
+    set(_PYQUICK_LIBTARGET libquick_mpi)
+    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/mpi")
+    set(_PYQUICK_LIBNAME "quick_mpi")
+    string(APPEND _PYQUICK_F90FLAGS " -DMPIV")
+    _pyquick_add_mpi_args()
+    message(STATUS "pyquick: binding against MPI libquick (${_PYQUICK_LIBNAME})")
 else()
     set(_PYQUICK_LIBTARGET libquick)
     set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/serial")

@@ -721,8 +721,14 @@ def test_impossible_multiplicity_raises_not_exits():
         except ValueError as e:
             print('VALUEERROR', e)
     ''')
+    # Under mpiexec (MPI build), the child must not inherit this rank's MPI
+    # identity: it would join the running job as a duplicate rank and corrupt
+    # its shared-memory transport. Without the launcher's variables the child
+    # starts as an independent single-rank run.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(('OMPI_', 'PMIX_', 'PRTE_', 'PMI_', 'HYDRA_'))}
     p = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
-                       timeout=120)
+                       timeout=120, env=env)
     assert p.returncode == 0, f"process died (exit {p.returncode}): {p.stdout[-300:]}"
     assert 'VALUEERROR' in p.stdout
     assert 'mult' in p.stdout.lower()

@@ -20,6 +20,7 @@ module pyquick
     use quick_exception_module, only : get_exception_message
     use quick_molsurface_module, only : generate_MKS_surfaces
     use quick_oeproperties_module, only : compute_esp, compute_ESP_charge, esp_charges
+    use quick_mpi_module, only : master, mpirank, mpisize, libMPIMode
 
     implicit none
 
@@ -39,7 +40,8 @@ module pyquick
               job_get_gradients, job_get_geometry, job_exception_message, &
               job_has_esp, job_get_esp_charges, &
               job_has_beta, job_get_beta_mo_energies, job_get_beta_density_matrix, &
-              job_has_optimized, job_opt_converged, job_get_optimized_geometry
+              job_has_optimized, job_opt_converged, job_get_optimized_geometry, &
+              set_mpi, get_build_info
 
     integer, parameter :: KEYWORD_LEN = 300
     integer, parameter :: INPUT_LEN   = 10000
@@ -77,6 +79,12 @@ module pyquick
     ! steps (only coordinates change), until job_close frees everything.
     logical :: job_open_flag = .false.
     integer :: job_nsteps = 0        ! steps run on the open persistent job
+
+    ! .true. while QUICK itself is running (from initialize1 to the end of a
+    ! job_run / job_open / job_step). Under MPI, a failure in that window may
+    ! hit one rank only while the others wait in a collective call, so fail()
+    ! aborts every rank instead of returning (see fail).
+    logical :: engine_running = .false.
 
     ! scalar results (always available after a successful job_run)
     ! job_e_core is QUICK's ECore: the core-core NUCLEAR REPULSION energy
@@ -358,7 +366,7 @@ contains
         ! max_cycles: for jobtype 2 only -- <= 0 emits a bare OPTIMIZE keyword
         !          (QUICK's default: run to convergence, no cap); > 0 emits
         !          OPTIMIZE=<n> to cap the number of optimization cycles.
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! GPU builds only: allmod exposes the gpu_* device routines and the basis
         ! arrays the uploads need. Compiled out on the CPU build (needs the build
         ! to preprocess this file: -cpp, and -DGPU for GPU builds).
@@ -369,18 +377,16 @@ contains
         integer, intent(in) :: max_cycles
         ! External free subroutines in libquick.so
         external :: initialize1, read_Job_and_Atom, getMol, getEnergy, dipole
-        external :: finalize, outputCopyright, PrtDate, quick_open, dl_find
+        external :: finalize, dl_find
 
         character(len=:), allocatable :: keyword_line
-        character(len=:), allocatable :: null_dev
         character(len=10) :: kwlen_str
         character(len=12) :: cyc_str
         character(len=1) :: open_mode
-        integer :: ierr, i, j, k, ios
+        integer :: ierr, i, j, k
         integer :: natm_type
         integer :: atm_type_id(geom_natom)
-        logical :: new_type, unit_open
-        character(len=256) :: note
+        logical :: new_type
 
         ierr = 0
 
@@ -456,68 +462,31 @@ contains
         isTemplate = .true.
 
         ! --- QUICK call chain (follows main.f90) ---
+        engine_running = .true.
         call initialize1(ierr)
         if (ierr /= 0) then
             call fail('job_run: initialize1 failed')
             return
         end if
 
-        call set_quick_files(.true., ierr)
-        if (ierr /= 0) then
-            call fail('job_run: set_quick_files failed')
-            return
-        end if
-
-        ! --- open QUICK's diagnostic log ---
-        if (do_log /= 0) then
-            ! Normal case: a real <output_stem>.out file, as set_quick_files
-            ! derived it. quick_open backs up any pre-existing file to '<file>~'.
-            call quick_open(iOutFile, outFileName, 'U', 'F', open_mode, .false., ierr)
-            if (ierr /= 0) then
-                call fail('job_run: quick_open failed')
-                return
-            end if
+        ! --- QUICK's diagnostic log: rank 0 only, as in main.f90. MPI worker
+        ! ranks get the null device, so a stray write never creates a file ---
+        if (master) then
+            call open_log('job_run', do_log, open_mode)
         else
-            ! Opted out: send the log to the platform null device so the run
-            ! leaves nothing on disk. Open the unit directly rather than through
-            ! quick_open, which would try to back up the device with 'mv'. The
-            ! device name is chosen at runtime so this also works on Windows (NUL).
-            null_dev = null_device()
-            outFileName = null_dev
-            inquire(unit=iOutFile, opened=unit_open)
-            if (unit_open) close(iOutFile)
-            open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
-                 action='WRITE', iostat=ios)
-            if (ios /= 0) then
-                call fail('job_run: could not open null output device')
-                return
-            end if
+            call open_null_log('job_run')
         end if
-
-        call outputCopyright(iOutFile, ierr)
-        if (ierr /= 0) then
-            call fail('job_run: outputCopyright failed')
-            return
-        end if
-
-        note = 'TASK STARTS ON:'
-        call PrtDate(iOutFile, note, ierr)
-        if (ierr /= 0) then
-            call fail('job_run: PrtDate failed')
-            return
-        end if
-
-        call print_quick_io_file(iOutFile, ierr)
-        if (ierr /= 0) then
-            call fail('job_run: print_quick_io_file failed')
-            return
-        end if
+        if (had_error) return
 
 #if defined(GPU)
         ! --- GPU: create context and pick a device (mirrors main.f90) ---
         call gpu_new(ierr)
         call gpu_init_device(ierr)
         call gpu_write_info(iOutFile, ierr)
+#elif defined(MPIV_GPU)
+        ! --- multi-GPU: one device per rank (main.f90's MPIV_GPU branch) ---
+        call start_mgpu('job_run')
+        if (had_error) return
 #endif
 
         ! reads keyword from quick_api%Keywd; skips coordinate read (apiMode)
@@ -588,7 +557,7 @@ contains
             return
         end if
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: allocate scratch, upload method + molecule/coords ---
         call gpu_allocate_scratch(quick_method%grad .or. quick_method%opt)
         call upload(quick_method, ierr)
@@ -604,7 +573,7 @@ contains
         call getEriPrecomputables()
         call schwarzoff()
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: upload basis + Schwarz cutoffs (needs the arrays just built) ---
         if (.not. quick_method%opt) then
             call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
@@ -642,7 +611,7 @@ contains
                               '(add the LOPT keyword)')
                     return
                 end if
-                call dl_find(ierr, .true.)
+                call dl_find(ierr, master)
             else
                 call lopt(ierr)
             end if
@@ -674,13 +643,17 @@ contains
         ! --- post-SCF charges/dipole + harvest all results ---
         call harvest_results(quick_method%grad)
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: free device scratch and context ---
         call gpu_deallocate_scratch(quick_method%grad .or. quick_method%opt)
+#if defined(MPIV_GPU)
+        call delete_mgpu_setup(ierr)
+#endif
         call gpu_delete(ierr)
 #endif
 
         job_active = .true.
+        engine_running = .false.
 
     end subroutine job_run
 
@@ -693,7 +666,7 @@ contains
         ! One-time setup for a fixed molecule. Prerequisites (as for job_run):
         ! set_calc, set_basis and read_geom (the initial geometry) must be done.
         ! do_log: 1 = write <stem>.out, 0 = null device.
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! GPU builds only: allmod exposes the gpu_* device routines (use is
         ! subroutine-scoped in Fortran, so job_run's own `use allmod` doesn't
         ! cover this subroutine -- it needs its own).
@@ -701,14 +674,12 @@ contains
 #endif
         integer, intent(in) :: do_log
         external :: initialize1, read_Job_and_Atom, getMol
-        external :: outputCopyright, PrtDate, quick_open
 
-        character(len=:), allocatable :: keyword_line, null_dev
+        character(len=:), allocatable :: keyword_line
         character(len=10) :: kwlen_str
-        integer :: ierr, i, j, k, ios, natm_type
+        integer :: ierr, i, j, k, natm_type
         integer :: atm_type_id(geom_natom)
-        logical :: new_type, unit_open
-        character(len=256) :: note
+        logical :: new_type
 
         ierr = 0
         if (job_open_flag) then
@@ -734,34 +705,27 @@ contains
         inFileName = trim(output_stem) // '.in'
         isTemplate = .true.
 
+        engine_running = .true.
         call initialize1(ierr)
         if (ierr /= 0) then; call fail('job_open: initialize1 failed'); return; end if
-        call set_quick_files(.true., ierr)
-        if (ierr /= 0) then; call fail('job_open: set_quick_files failed'); return; end if
 
-        if (do_log /= 0) then
-            call quick_open(iOutFile, outFileName, 'U', 'F', 'R', .false., ierr)
-            if (ierr /= 0) then; call fail('job_open: quick_open failed'); return; end if
+        ! log on rank 0 only; MPI workers write to the null device (see job_run)
+        if (master) then
+            call open_log('job_open', do_log, 'R')
         else
-            null_dev = null_device()
-            outFileName = null_dev
-            inquire(unit=iOutFile, opened=unit_open)
-            if (unit_open) close(iOutFile)
-            open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
-                 action='WRITE', iostat=ios)
-            if (ios /= 0) then; call fail('job_open: could not open null output device'); return; end if
+            call open_null_log('job_open')
         end if
-
-        call outputCopyright(iOutFile, ierr)
-        note = 'TASK STARTS ON:'
-        call PrtDate(iOutFile, note, ierr)
-        call print_quick_io_file(iOutFile, ierr)
+        if (had_error) return
 
 #if defined(GPU)
         ! --- GPU: create context and pick a device (mirrors job_run) ---
         call gpu_new(ierr)
         call gpu_init_device(ierr)
         call gpu_write_info(iOutFile, ierr)
+#elif defined(MPIV_GPU)
+        ! --- multi-GPU: one device per rank (main.f90's MPIV_GPU branch) ---
+        call start_mgpu('job_open')
+        if (had_error) return
 #endif
 
         call read_Job_and_Atom(ierr)
@@ -803,7 +767,7 @@ contains
         call getMol(ierr)
         if (ierr /= 0) then; call fail('job_open: getMol failed'); return; end if
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: allocate persistent scratch (always gradient-capable -- job_step
         ! toggles want_gradient per call, so this can't be sized in advance, unlike
         ! job_run's one-shot `quick_method%grad .or. quick_method%opt`) and upload
@@ -815,6 +779,7 @@ contains
         job_open_flag = .true.
         job_active    = .true.
         job_nsteps    = 0
+        engine_running = .false.
     end subroutine job_open
 
     subroutine job_step(want_gradient)
@@ -822,7 +787,7 @@ contains
         ! coordinates (same atoms). want_gradient: 1 = also compute the gradient.
         ! getMol is NOT called, so quick_qm_struct%dense from the previous step
         ! survives and seeds this SCF.
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         use allmod
 #endif
         integer, intent(in) :: want_gradient
@@ -837,6 +802,7 @@ contains
             call fail('job_step: geometry has a different number of atoms than the open job')
             return
         end if
+        engine_running = .true.
 
         ! update coordinates only (atoms are fixed for the job)
         do i = 1, natom
@@ -854,7 +820,7 @@ contains
         call getEriPrecomputables()
         call schwarzoff()
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: re-upload geometry + basis for this step. gpu_upload_basis and
         ! gpu_upload_oei also bake in geometry-derived quantities (interatomic
         ! distances, Gaussian product centers), so this must repeat every step,
@@ -893,7 +859,7 @@ contains
         end if
         call run_esp_charges()
 
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: intentionally NOT calling gpu_cleanup() here. ---
         ! quick_api_module's run_quick calls it at this point to free the step's
         ! geometry-dependent device arrays, but here it segfaults on its first
@@ -908,6 +874,7 @@ contains
 
         call harvest_results(want_gradient /= 0)
         job_nsteps = job_nsteps + 1
+        engine_running = .false.
     end subroutine job_step
 
     subroutine job_close()
@@ -935,12 +902,15 @@ contains
         ! delete_quick_job, including the libxc GPU cleanup that job_run's
         ! one-shot teardown skips (harmless there for non-DFT jobs, but a
         ! persistent job can run DFT).
-#if defined(GPU)
+#if defined(GPU) || defined(MPIV_GPU)
         use allmod
         integer :: ierr
         ierr = 0
         call delete(quick_method, ierr)
         call gpu_deallocate_scratch(.true.)
+#if defined(MPIV_GPU)
+        call delete_mgpu_setup(ierr)
+#endif
         call gpu_delete(ierr)
 #endif
     end subroutine job_gpu_teardown
@@ -950,7 +920,7 @@ contains
         external :: dipole
         logical, intent(in) :: did_gradient
 
-        if (quick_method%dipole) call dipole
+        if (quick_method%dipole .and. master) call dipole
 
         job_total_energy   = quick_qm_struct%ETot
         job_e_core         = quick_qm_struct%ECore
@@ -1005,15 +975,32 @@ contains
         ! writing the <stem>.vdw surface file, so log=False leaves nothing on
         ! disk (quick_open cannot target the null device: it renames an
         ! existing file with mv first).
+#ifdef MPIV
+        use mpi
+#endif
         double precision, allocatable :: esp_on_points(:)
+#ifdef MPIV
+        integer :: ierr
+#endif
 
         if (allocated(esp_charges)) deallocate(esp_charges)
         if (.not. quick_method%esp_charge) return
 
+#ifdef MPIV
+        ! as compute_oeprop: the master builds the surface, every rank gets the
+        ! points; compute_esp splits the shells over ranks and reduces onto the
+        ! master; compute_ESP_charge (the fit) runs on the master only
+        if (master) call generate_MKS_surfaces()
+        call MPI_Bcast(quick_molspec%nvdwpoint, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+        if (.not. master) allocate(quick_molspec%vdwpointxyz(3, quick_molspec%nvdwpoint))
+        call MPI_Bcast(quick_molspec%vdwpointxyz, 3 * quick_molspec%nvdwpoint, &
+                       MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+#else
         call generate_MKS_surfaces()
+#endif
         allocate(esp_on_points(quick_molspec%nvdwpoint))
         call compute_esp(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
-        call compute_ESP_charge(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
+        if (master) call compute_ESP_charge(quick_molspec%nvdwpoint, quick_molspec%vdwpointxyz, esp_on_points)
         deallocate(esp_on_points)
         deallocate(quick_molspec%vdwpointxyz)
     end subroutine run_esp_charges
@@ -1308,10 +1295,163 @@ contains
     end subroutine append_method
 
     subroutine fail(message)
+        ! Record an error; Python's _checked() raises it as RuntimeError.
+        ! MPI with more than one rank: once QUICK is running (engine_running),
+        ! a failure may be local to one rank while the others wait in a
+        ! collective call, so returning would leave them hanging. Abort every
+        ! rank instead, as QUICK's own quick_exit does. Errors before QUICK
+        ! starts (setup, geometry) occur on every rank alike and stay catchable.
+#ifdef MPIV
+        use mpi
+        use iso_fortran_env, only : error_unit
+        integer :: ierr_mpi
+#endif
         character(len=*), intent(in) :: message
         had_error     = .true.
         error_message = trim(message)
+#ifdef MPIV
+        if (engine_running .and. mpisize > 1) then
+            write(error_unit, '(A,I0,A)') 'pyquick: rank ', mpirank, ': ' // &
+                trim(message) // ' -- aborting all MPI ranks'
+            flush(error_unit)
+            call MPI_Abort(MPI_COMM_WORLD, 1, ierr_mpi)
+        end if
+#endif
     end subroutine fail
+
+    ! -----------------------------------------------------------------------
+    ! MPI (libquick_mpi builds). Python owns MPI through mpi4py; QUICK borrows
+    ! it in library mode, exactly as Amber does through setQuickMPI.
+    ! Both routines exist in every build -- only their bodies are guarded --
+    ! because f2py scans this file before preprocessing and would otherwise
+    ! wrap a symbol that a serial build never compiles.
+    ! -----------------------------------------------------------------------
+
+    subroutine set_mpi(rank, nprocs)
+        ! Hand MPI_COMM_WORLD's rank and size to QUICK before its first job.
+        ! libMPIMode makes initialize1 skip MPI_Init (mpi4py already called it);
+        ! finalize(..., 1), used throughout this module, already skips
+        ! MPI_Finalize. No-op outside MPI builds.
+        integer, intent(in) :: rank, nprocs
+#ifdef MPIV
+        mpirank    = rank
+        mpisize    = nprocs
+        libMPIMode = .true.
+        master     = (rank == 0)
+#endif
+    end subroutine set_mpi
+
+    subroutine get_build_info(is_mpi, is_gpu)
+        ! is_mpi: built against an MPI libquick (libquick_mpi, libquick_mpi_cuda).
+        ! is_gpu: built against a GPU libquick (libquick_cuda/_hip, or the
+        !         multi-GPU libquick_mpi_cuda/_hip).
+        !f2py intent(out) is_mpi, is_gpu
+        logical, intent(out) :: is_mpi, is_gpu
+#ifdef MPIV
+        is_mpi = .true.
+#else
+        is_mpi = .false.
+#endif
+#if defined(GPU) || defined(MPIV_GPU)
+        is_gpu = .true.
+#else
+        is_gpu = .false.
+#endif
+    end subroutine get_build_info
+
+    subroutine start_mgpu(caller)
+        ! Multi-GPU builds (MPIV_GPU): give every rank its own GPU, as main.f90
+        ! does -- rank r takes visible device r % count, and QUICK refuses more
+        ! ranks than GPUs (mgpu_query error 42). That error is reported by name
+        ! here instead of through SAFE_CALL's exit(); with more than one rank,
+        ! fail() then aborts every rank. Empty outside MPIV_GPU builds.
+#if defined(MPIV_GPU)
+        use quick_mpi_module, only : mgpu_id, mgpu_ids
+#endif
+        character(len=*), intent(in) :: caller
+#if defined(MPIV_GPU)
+        external :: gpu_new, mgpu_query, mgpu_setup, mgpu_write_info, mgpu_init_device
+        integer :: ierr
+        character(len=12) :: num
+
+        ierr = 0
+        call gpu_new(mpirank, ierr)
+        call mgpu_query(mpisize, mpirank, mgpu_id, ierr)
+        if (ierr == 42) then
+            write(num, '(I0)') mpisize
+            call fail(caller // ': more MPI ranks (' // trim(num) // ') than visible GPUs; ' // &
+                      'run one rank per GPU (CUDA_VISIBLE_DEVICES selects them)')
+            return
+        else if (ierr /= 0) then
+            write(num, '(I0)') ierr
+            call fail(caller // ': no usable GPU for this rank (QUICK error ' // trim(num) // ')')
+            return
+        end if
+        call mgpu_setup()                  ! master gathers every rank's device id
+        if (master) call mgpu_write_info(iOutFile, mpisize, mgpu_ids, ierr)
+        call mgpu_init_device(mpirank, mpisize, mgpu_id, ierr)
+#endif
+    end subroutine start_mgpu
+
+    subroutine open_log(caller, do_log, open_mode)
+        ! Rank 0 (and every serial run): set QUICK's file names, open its log
+        ! (<output_stem>.out, or the null device when do_log == 0) and write the
+        ! header, as main.f90 does on its master. open_mode: 'R' replaces the
+        ! file, 'A' appends to it. Errors are reported through fail().
+#ifdef MPIV
+        use quick_mpi_module, only : print_quick_mpi
+#endif
+        external :: outputCopyright, PrtDate, quick_open
+        character(len=*), intent(in) :: caller
+        integer, intent(in) :: do_log
+        character(len=1), intent(in) :: open_mode
+        integer :: ierr
+        character(len=256) :: note
+
+        ierr = 0
+        call set_quick_files(.true., ierr)
+        if (ierr /= 0) then; call fail(caller // ': set_quick_files failed'); return; end if
+
+        if (do_log /= 0) then
+            ! a real <output_stem>.out file, as set_quick_files derived it;
+            ! quick_open backs up any pre-existing file to '<file>~'
+            call quick_open(iOutFile, outFileName, 'U', 'F', open_mode, .false., ierr)
+            if (ierr /= 0) then; call fail(caller // ': quick_open failed'); return; end if
+        else
+            call open_null_log(caller)
+            if (had_error) return
+        end if
+
+        call outputCopyright(iOutFile, ierr)
+        if (ierr /= 0) then; call fail(caller // ': outputCopyright failed'); return; end if
+        note = 'TASK STARTS ON:'
+        call PrtDate(iOutFile, note, ierr)
+        if (ierr /= 0) then; call fail(caller // ': PrtDate failed'); return; end if
+        call print_quick_io_file(iOutFile, ierr)
+        if (ierr /= 0) then; call fail(caller // ': print_quick_io_file failed'); return; end if
+#ifdef MPIV
+        call print_quick_mpi(iOutFile, ierr)
+#endif
+    end subroutine open_log
+
+    subroutine open_null_log(caller)
+        ! Send QUICK's log to the platform null device (log=False, and every MPI
+        ! worker rank) so the run leaves nothing on disk. Opened directly rather
+        ! than through quick_open, which would try to back up the device with
+        ! 'mv'. The device name is chosen at runtime (NUL on Windows).
+        character(len=*), intent(in) :: caller
+        character(len=:), allocatable :: null_dev
+        logical :: unit_open
+        integer :: ios
+
+        null_dev = null_device()
+        outFileName = null_dev
+        inquire(unit=iOutFile, opened=unit_open)
+        if (unit_open) close(iOutFile)
+        open(unit=iOutFile, file=null_dev, status='UNKNOWN', form='FORMATTED', &
+             action='WRITE', iostat=ios)
+        if (ios /= 0) call fail(caller // ': could not open null output device')
+    end subroutine open_null_log
 
     subroutine job_exception_message(code, msg)
         ! Expose QUICK's error text for a code, so Python can report/inspect it.
