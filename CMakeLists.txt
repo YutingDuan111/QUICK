@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.12.0) # version 3.9.0 needed for FindMPI and FindOpenMP versions which provide imported targets
 
-project(quick LANGUAGES NONE VERSION 25.03)
+project(quick LANGUAGES NONE VERSION 26.03)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/quick-cmake)
 
@@ -322,10 +322,21 @@ if("${CMAKE_Fortran_COMPILER_ID}" STREQUAL "PGI" OR "${CMAKE_Fortran_COMPILER_ID
 endif()
 
 
-# CRAY: NOT SUPPORTED
+# CRAY
 # --------------------------------------------------------------------
-if(${COMPILER} STREQUAL CRAY)
-    message(FATAL_ERROR "CRAY compiler not supported by QUICK.")
+
+if("${CMAKE_C_COMPILER_ID}" STREQUAL "CRAY")
+    list(APPEND OPT_CFLAGS "-O2" "-funroll-loops" "-ffast-math")
+#    list(APPEND OPT_CFLAGS "-Ofast" "-funroll-loops")
+endif()
+
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "CRAY")
+    list(APPEND OPT_CXXFLAGS "-O2" "-funroll-loops" "-ffast-math")
+#    list(APPEND OPT_CXXFLAGS "-Ofast" "-funroll-loops")
+endif()
+
+if("${CMAKE_Fortran_COMPILER_ID}" STREQUAL "CRAY")
+#    list(APPEND OPT_FFLAGS "-O3" "-hfp3")
 endif()
 
 

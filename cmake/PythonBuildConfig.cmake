@@ -31,7 +31,7 @@ if(BUILD_PYTHON)
 		# check "normal" packages
 		# --------------------------------------------------------------------
 
-		set(NEEDED_PYTHON_PACKAGES numpy scipy matplotlib setuptools pandas numba gemmi)
+		set(NEEDED_PYTHON_PACKAGES numpy scipy matplotlib setuptools pandas numba gemmi Bio rich freesasa sklearn sympy pydantic psutil networkx)
 		set(HAVE_ALL_PYTHON_PACKAGES TRUE)
 
 		# in Amber releases cython is not needed since pytraj will have been pre-cythonized

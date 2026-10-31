@@ -102,6 +102,8 @@ pdb4amber
 packmol_memgen
 packmol_memgen/web
 PyPE_RESP
+proprep
+rismtools
 
 #	moft
 moft
@@ -244,7 +246,7 @@ endif()
 
 #Python programs (controlled by BUILD_PYTHON option in PythonConfig.cmake)
 if(NOT BUILD_PYTHON)
-	disable_tools("Python programs are disabled" pysander pytraj pymsmt mmpbsa_py parmed packmol_memgen packmol_memgen/web tcpb-cpp/pytcpb)
+	disable_tools("Python programs are disabled" pysander pytraj pymsmt mmpbsa_py parmed packmol_memgen packmol_memgen/web tcpb-cpp/pytcpb proprep)
 endif()
 
 option(BUILD_PMMG_GUI "Install the packmol-memgen web GUI (packmol-memgen-gui)" ON)
