@@ -1,5 +1,6 @@
 import atexit as _atexit
 import copy as _copy
+import os as _os
 
 import numpy as _np
 
@@ -618,6 +619,60 @@ class _PyQuickEngine:
 _DEFAULT_LOG_STEM = 'pyquick_job'
 
 
+def read_xyz(path):
+    """Read an .xyz file; returns its geometry as a 'SYMBOL X Y Z' string.
+
+    The file holds the atom count, a comment line (may be empty), then one
+    'SYMBOL X Y Z' line per atom in Angstrom; columns after Z are ignored.
+    Raises ValueError for a malformed file or one with several geometries.
+    """
+    name = _os.fspath(path)
+    with open(path) as f:
+        lines = f.read().splitlines()
+    try:
+        natoms = int(lines[0])
+    except (IndexError, ValueError):
+        natoms = 0
+    if natoms < 1:
+        raise ValueError(f"{name}: the first line must be the atom count")
+
+    atom_lines = lines[2:2 + natoms]
+    extra_lines = lines[2 + natoms:]
+    found = sum(1 for line in atom_lines if line.strip())
+    if found < natoms:
+        raise ValueError(f"{name}: expected {natoms} atoms, found {found}")
+    if any(line.strip() for line in extra_lines):
+        raise ValueError(f"{name}: must hold one geometry, but there are lines "
+                         f"after the {natoms} atoms")
+
+    atoms = []
+    for number, line in enumerate(atom_lines, start=3):
+        fields = line.split()
+        try:
+            [float(x) for x in fields[1:4]]
+            if len(fields) < 4:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"{name}: line {number}: expected SYMBOL X Y Z") from None
+        atoms.append(' '.join(fields[:4]))
+    return '\n'.join(atoms)
+
+
+def _resolve_geometry(geometry):
+    """Geometry string for *geometry*, reading the file if it is an .xyz path.
+
+    A path is an os.PathLike or a string with no line break ending in .xyz;
+    anything else is left for read_geom to parse.
+    """
+    if isinstance(geometry, _os.PathLike):
+        return read_xyz(geometry)
+    if isinstance(geometry, str):
+        path = geometry.strip()
+        if path.lower().endswith('.xyz') and '\n' not in path:
+            return read_xyz(path)
+    return geometry
+
+
 def _count_atoms(geometry):
     """Number of atom lines ('SYMBOL X Y Z') in a geometry string.
 
@@ -919,7 +974,8 @@ class PyQuick:
     def get_energy(self, geometry, name=None, point_charges=None):
         """Single-point energy on *geometry*; returns a :class:`Result`.
 
-        *geometry* is a 'SYMBOL X Y Z' multi-line string (Angstrom).  *name*
+        *geometry* is a 'SYMBOL X Y Z' multi-line string (Angstrom) or the path of
+        an .xyz file (see :func:`read_xyz`).  *name*
         labels the run (it lands in ``Result.metadata['name']``) and, when
         logging is on, names the log file — ``name='water'`` -> ``water.out``.
         A single engine is reused across successive calls on the same
@@ -930,6 +986,7 @@ class PyQuick:
         (density, ``nuclear_repulsion``, gradient); their mutual repulsion is
         reported as ``e_external_charge`` and is never part of ``total_energy``.
         """
+        geometry = _resolve_geometry(geometry)
         job = self._prepare(geometry, name, point_charges)
         job.run(jobtype=0, log=self.log)
         return Result._from_engine(job, self, geometry, name)
@@ -943,6 +1000,7 @@ class PyQuick:
         *name* labels the run and, when logging is on, names the log file.
         *point_charges* is as for :meth:`get_energy`.
         """
+        geometry = _resolve_geometry(geometry)
         job = self._prepare(geometry, name, point_charges)
         job.run(jobtype=1, log=self.log)
         return Result._from_engine(job, self, geometry, name)
@@ -973,6 +1031,7 @@ class PyQuick:
         *point_charges* is as for :meth:`get_energy`; the charges stay fixed
         while the molecule relaxes.
         """
+        geometry = _resolve_geometry(geometry)
         # DL-Find (the default) fails on < 3 atoms; steer the user to LOPT.
         using_lopt = any(str(k).upper() == 'LOPT' for k in self.keywords)
         if not using_lopt and _count_atoms(geometry) < 3:
@@ -1408,6 +1467,7 @@ class Job:
     """
 
     def __init__(self, calc, geometry, reuse_density=True, point_charges=None):
+        geometry = _resolve_geometry(geometry)
         self._calc = calc
         self._reuse_density = bool(reuse_density)   # reserved; density is reused
         self._natoms = _count_atoms(geometry)
@@ -1425,6 +1485,7 @@ class Job:
         """
         if not self._open:
             raise RuntimeError("this Job has been deleted")
+        geometry = _resolve_geometry(geometry)
         if _count_atoms(geometry) != self._natoms:
             raise ValueError(
                 "a Job is fixed to one molecule; the atom count changed — "

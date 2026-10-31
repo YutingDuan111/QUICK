@@ -216,6 +216,15 @@ def test_log_false_leaves_no_files_on_any_rank(shared_dir):
     assert _all_ranks_agree(files == []), f"rank {RANK} sees {files}"
 
 
+def test_xyz_file_on_all_ranks(shared_dir):
+    if RANK == 0:
+        with open('mol.xyz', 'w') as f:
+            f.write("3\nwater\n" + WATER.lstrip())
+    COMM.Barrier()
+    ok, problems = _identical_to_rank0(_hf().get_energy('mol.xyz'))
+    assert ok, f"rank {RANK}: differs from rank 0 in {problems}"
+
+
 # ---------------------------------------------------------------------------
 # errors before QUICK starts stay catchable, and leave no rank behind
 # ---------------------------------------------------------------------------
