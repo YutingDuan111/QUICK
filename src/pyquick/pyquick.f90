@@ -26,7 +26,7 @@ module pyquick
     use quick_exception_module, only : get_exception_message
     use quick_molsurface_module, only : generate_MKS_surfaces
     use quick_oeproperties_module, only : compute_esp, compute_ESP_charge, esp_charges
-    use quick_mpi_module, only : master, mpirank, mpisize, libMPIMode
+    use quick_mpi_module, only : master, quick_comm_rank, quick_comm_size, libMPIMode
 
     implicit none
 
@@ -397,10 +397,12 @@ contains
         ! max_cycles: for jobtype 2 only -- <= 0 uses DEFAULT_OPT_CYCLES; > 0 emits
         !          OPTIMIZE=<n> to cap the number of optimization cycles.
 #if defined(GPU) || defined(MPIV_GPU)
-        ! GPU builds only: allmod exposes the gpu_* device routines and the basis
-        ! arrays the uploads need. Compiled out on the CPU build (needs the build
-        ! to preprocess this file: -cpp, and -DGPU for GPU builds).
-        use allmod
+        ! GPU builds only: the basis arrays the uploads need. Compiled out on the
+        ! CPU build (needs the build to preprocess this file: -cpp, and -DGPU for
+        ! GPU builds).
+        use quick_basis_module, only : aexp, cutprim, dcoeff, jbasis, jshell, maxcontract, &
+                                       ncontract, nprim, nshell, Ycutoff
+        use quick_method_module, only : upload
 #endif
         integer, intent(in) :: jobtype
         integer, intent(in) :: do_log
@@ -532,7 +534,7 @@ contains
         natom = geom_natom
         call prepare_point_charges()
 
-        call alloc(quick_molspec, .false., ierr)
+        call alloc(quick_molspec, quick_method%readxyz, ierr)
         if (ierr /= 0) then
             call fail('job_run: alloc(quick_molspec) failed')
             return
@@ -702,10 +704,7 @@ contains
         ! set_calc, set_basis and read_geom (the initial geometry) must be done.
         ! do_log: 1 = write <stem>.out, 0 = null device.
 #if defined(GPU) || defined(MPIV_GPU)
-        ! GPU builds only: allmod exposes the gpu_* device routines (use is
-        ! subroutine-scoped in Fortran, so job_run's own `use allmod` doesn't
-        ! cover this subroutine -- it needs its own).
-        use allmod
+        use quick_method_module, only : upload
 #endif
         integer, intent(in) :: do_log
         external :: initialize1, read_Job_and_Atom, getMol
@@ -770,7 +769,7 @@ contains
 
         natom = geom_natom
         call prepare_point_charges()
-        call alloc(quick_molspec, .false., ierr)
+        call alloc(quick_molspec, quick_method%readxyz, ierr)
         if (ierr /= 0) then; call fail('job_open: alloc(quick_molspec) failed'); return; end if
         call inject_point_charges()
 
@@ -825,7 +824,9 @@ contains
         ! getMol is NOT called, so quick_qm_struct%dense from the previous step
         ! survives and seeds this SCF.
 #if defined(GPU) || defined(MPIV_GPU)
-        use allmod
+        use quick_basis_module, only : aexp, cutprim, dcoeff, jbasis, jshell, maxcontract, &
+                                       ncontract, nprim, nshell, Ycutoff
+        use quick_method_module, only : upload
 #endif
         integer, intent(in) :: want_gradient
         integer :: ierr, i, j
@@ -940,7 +941,7 @@ contains
         ! one-shot teardown skips (harmless there for non-DFT jobs, but a
         ! persistent job can run DFT).
 #if defined(GPU) || defined(MPIV_GPU)
-        use allmod
+        use quick_method_module, only : delete
         integer :: ierr
         ierr = 0
         call delete(quick_method, ierr)
@@ -956,6 +957,7 @@ contains
         ! Copy energies/properties out of QUICK's module state after a run.
 #ifdef MPIV
         use mpi
+        use quick_mpi_module, only : quick_comm
         integer :: ierr_mpi
 #endif
         external :: dipole
@@ -971,7 +973,7 @@ contains
         ! under MPI each rank builds part of the one-electron matrix, so its E1e is
         ! partial. QUICK reduces Eel but not E1e; rank 0 needs the sum.
         call MPI_Reduce(quick_qm_struct%E1e, job_e_1e, 1, MPI_DOUBLE_PRECISION, MPI_SUM, &
-                        0, MPI_COMM_WORLD, ierr_mpi)
+                        0, quick_comm, ierr_mpi)
 #endif
         job_e_xc           = quick_qm_struct%Exc
         if (master) call compute_kinetic_energy()
@@ -1036,6 +1038,7 @@ contains
         ! existing file with mv first).
 #ifdef MPIV
         use mpi
+        use quick_mpi_module, only : quick_comm
 #endif
         double precision, allocatable :: esp_on_points(:)
 #ifdef MPIV
@@ -1050,10 +1053,10 @@ contains
         ! points; compute_esp splits the shells over ranks and reduces onto the
         ! master; compute_ESP_charge (the fit) runs on the master only
         if (master) call generate_MKS_surfaces()
-        call MPI_Bcast(quick_molspec%nvdwpoint, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
+        call MPI_Bcast(quick_molspec%nvdwpoint, 1, MPI_INTEGER, 0, quick_comm, ierr)
         if (.not. master) allocate(quick_molspec%vdwpointxyz(3, quick_molspec%nvdwpoint))
         call MPI_Bcast(quick_molspec%vdwpointxyz, 3 * quick_molspec%nvdwpoint, &
-                       MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+                       MPI_DOUBLE_PRECISION, 0, quick_comm, ierr)
 #else
         call generate_MKS_surfaces()
 #endif
@@ -1540,8 +1543,8 @@ contains
         had_error     = .true.
         error_message = trim(message)
 #ifdef MPIV
-        if (engine_running .and. mpisize > 1) then
-            write(error_unit, '(A,I0,A)') 'pyquick: rank ', mpirank, ': ' // &
+        if (engine_running .and. quick_comm_size > 1) then
+            write(error_unit, '(A,I0,A)') 'pyquick: rank ', quick_comm_rank, ': ' // &
                 trim(message) // ' -- aborting all MPI ranks'
             flush(error_unit)
             call MPI_Abort(MPI_COMM_WORLD, 1, ierr_mpi)
@@ -1558,16 +1561,25 @@ contains
     ! -----------------------------------------------------------------------
 
     subroutine set_mpi(rank, nprocs)
-        ! Hand MPI_COMM_WORLD's rank and size to QUICK before its first job.
-        ! libMPIMode makes initialize1 skip MPI_Init (mpi4py already called it);
-        ! finalize(..., 1), used throughout this module, already skips
-        ! MPI_Finalize. No-op outside MPI builds.
+        ! Give QUICK its own copy of MPI_COMM_WORLD before its first job, as
+        ! setQuickMPI does for Amber. libMPIMode makes initialize1 skip MPI_Init
+        ! (mpi4py already called it); finalize(..., 1), used throughout this
+        ! module, already skips MPI_Finalize. No-op outside MPI builds.
+#ifdef MPIV
+        use mpi
+        use quick_mpi_module, only : quick_comm, mpi_world_rank, mpi_world_size
+#endif
         integer, intent(in) :: rank, nprocs
 #ifdef MPIV
-        mpirank    = rank
-        mpisize    = nprocs
-        libMPIMode = .true.
-        master     = (rank == 0)
+        integer :: ierr_mpi
+
+        call MPI_Comm_dup(MPI_COMM_WORLD, quick_comm, ierr_mpi)
+        quick_comm_rank = rank
+        quick_comm_size = nprocs
+        mpi_world_rank  = rank
+        mpi_world_size  = nprocs
+        libMPIMode      = .true.
+        master          = (rank == 0)
 #endif
     end subroutine set_mpi
 
@@ -1590,13 +1602,13 @@ contains
     end subroutine get_build_info
 
     subroutine start_mgpu(caller)
-        ! Multi-GPU builds (MPIV_GPU): give every rank its own GPU, as main.f90
-        ! does -- rank r takes visible device r % count, and QUICK refuses more
-        ! ranks than GPUs (mgpu_query error 42). That error is reported by name
-        ! here instead of through SAFE_CALL's exit(); with more than one rank,
-        ! fail() then aborts every rank. Empty outside MPIV_GPU builds.
+        ! Multi-GPU builds (MPIV_GPU): give every rank a GPU, as main.f90 does --
+        ! rank r takes visible device r % count, so ranks share GPUs when there
+        ! are more ranks than GPUs. Errors go through fail() instead of
+        ! SAFE_CALL's exit(); with more than one rank, fail() aborts every rank.
+        ! Empty outside MPIV_GPU builds.
 #if defined(MPIV_GPU)
-        use quick_mpi_module, only : mgpu_id, mgpu_ids
+        use quick_mpi_module, only : quick_comm, mpi_world_rank, mgpu_id, mgpu_ids
 #endif
         character(len=*), intent(in) :: caller
 #if defined(MPIV_GPU)
@@ -1605,21 +1617,16 @@ contains
         character(len=12) :: num
 
         ierr = 0
-        call gpu_new(mpirank, ierr)
-        call mgpu_query(mpisize, mpirank, mgpu_id, ierr)
-        if (ierr == 42) then
-            write(num, '(I0)') mpisize
-            call fail(caller // ': more MPI ranks (' // trim(num) // ') than visible GPUs; ' // &
-                      'run one rank per GPU (CUDA_VISIBLE_DEVICES selects them)')
-            return
-        else if (ierr /= 0) then
+        call gpu_new(quick_comm_rank, ierr)
+        call mgpu_query(mpi_world_rank, mgpu_id, ierr)
+        if (ierr /= 0) then
             write(num, '(I0)') ierr
             call fail(caller // ': no usable GPU for this rank (QUICK error ' // trim(num) // ')')
             return
         end if
         call mgpu_setup()                  ! master gathers every rank's device id
-        if (master) call mgpu_write_info(iOutFile, mpisize, mgpu_ids, ierr)
-        call mgpu_init_device(mpirank, mpisize, mgpu_id, ierr)
+        if (master) call mgpu_write_info(iOutFile, quick_comm_size, mgpu_ids, ierr)
+        call mgpu_init_device(quick_comm, quick_comm_rank, quick_comm_size, mgpu_id, ierr)
 #endif
     end subroutine start_mgpu
 

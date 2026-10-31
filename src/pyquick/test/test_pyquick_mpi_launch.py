@@ -21,7 +21,7 @@ Optional environment variables:
 
 On a GPU-MPI build (one GPU per rank) the rank counts are capped at the number
 of GPUs, energies are compared to 1e-6 Ha (GPU sums use atomics) instead of
-1e-8, and test_more_ranks_than_gpus_fails_cleanly checks QUICK's GPU limit.
+1e-8, and test_more_ranks_than_gpus_share_them checks ranks sharing a GPU.
 
 Each case runs in a fresh process, which also matches how the `quick` binary
 references were made (one calculation per process).
@@ -174,8 +174,6 @@ def test_engine_error_aborts_without_hanging(tmp_path):
         r = pyquick.PyQuick('HF', 'NOT-A-REAL-BASIS', log=False).get_energy({WATER!r})
         print('RESULT unexpectedly finished', r.total_energy)
     """)
-    if GPU and NGPU < 2:
-        pytest.skip("GPU-MPI build: needs 2 GPUs (with 1, QUICK's GPU limit stops the job first)")
     try:
         proc = _launch(tmp_path, script, nranks=2)
     except subprocess.TimeoutExpired:
@@ -214,17 +212,14 @@ def test_task_farm_example(tmp_path):
         assert float(farmed[basis]) == pytest.approx(float(energy), abs=1e-8), basis
 
 
-def test_more_ranks_than_gpus_fails_cleanly(tmp_path):
-    """GPU-MPI build: QUICK needs one GPU per rank. One rank too many must stop
-    every rank with a message naming the GPU shortage -- no hang, no result."""
+def test_more_ranks_than_gpus_share_them(tmp_path, one_rank):
+    """GPU-MPI build: rank r uses visible GPU r % count, so one rank more than
+    there are GPUs still runs, with two ranks on one GPU."""
     if not GPU:
         pytest.skip("GPU-MPI build only")
     if NGPU + 1 > (os.cpu_count() or 1) and "PYQUICK_MPIEXEC" not in os.environ:
         pytest.skip("not enough cores for one rank more than the GPUs")
-    try:
-        proc = _launch(tmp_path, ENERGY_SCRIPT, nranks=NGPU + 1)
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"job hung for {TIMEOUT} s instead of stopping")
-    assert proc.returncode != 0
-    assert "RESULT" not in proc.stdout
-    assert "GPUs" in proc.stdout + proc.stderr, proc.stderr[-2000:]
+    res = _result(_launch(tmp_path, ENERGY_SCRIPT, nranks=NGPU + 1))
+    assert res["size"] == NGPU + 1
+    for method in ("HF", "B3LYP"):
+        assert res[method] == pytest.approx(one_rank[method], abs=TOL_RANKS), method

@@ -141,8 +141,7 @@ Run with **at most one rank per visible GPU**; pick the GPUs with `CUDA_VISIBLE_
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1 mpiexec -n 2 python3 -m mpi4py my_script.py
 ```
 
-- Rank r uses visible GPU `r % count`. More ranks than GPUs stops every rank with
-  `more MPI ranks (N) than visible GPUs` (QUICK's own limit).
+- Rank r uses visible GPU `r % count`, so with more ranks than GPUs some ranks share a GPU.
 - Set `CUDA_DEVICE_ORDER=PCI_BUS_ID`: by default CUDA numbers GPUs fastest-first, so on a
   machine with mixed GPUs `CUDA_VISIBLE_DEVICES=0,1` may not be the cards `nvidia-smi` calls
   0 and 1 (and a build for one architecture cannot run on another).
