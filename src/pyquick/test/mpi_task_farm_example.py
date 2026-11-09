@@ -1,20 +1,18 @@
 """
-Task farming with the SERIAL pyquick build: each MPI rank runs its own,
+Task farming with the SERIAL pyquick engine: each MPI rank runs its own,
 independent calculations; mpi4py only splits the list and gathers the results.
 
     mpiexec -n 4 python -m mpi4py mpi_task_farm_example.py
 
-Use the serial build (the default `cmake -DPYTHON=TRUE`), NOT the MPI build.
-In the MPI build every calculation is shared by all ranks, so ranks running
-different molecules at the same time would wait on each other forever.
+Import pyquick.serial, not plain pyquick (which stops under mpiexec, to catch
+MPI scripts that forgot pyquick.mpi) and not pyquick.mpi (where every
+calculation is shared by all ranks, so ranks running different molecules at
+the same time would wait on each other forever).
 """
 
 from mpi4py import MPI
 
-import pyquick
-
-if getattr(pyquick, "mpi_enabled", lambda: False)():
-    raise SystemExit("task farming needs the serial pyquick build, not the MPI build")
+import pyquick.serial as pyquick
 
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()

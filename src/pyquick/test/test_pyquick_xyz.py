@@ -19,7 +19,9 @@ import pathlib
 
 import pytest
 
-pyquick = pytest.importorskip("pyquick")
+from pyquick_test_mode import import_pyquick  # noqa: E402
+
+pyquick = import_pyquick()     # PYQUICK_MODE picks the engine (pyquick_test_mode.py)
 
 WATER = """
     O  -0.33840   0.00380   0.23923

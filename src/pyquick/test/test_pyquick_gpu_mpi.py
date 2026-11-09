@@ -3,7 +3,7 @@ GPU-MPI tests for pyquick: one GPU per MPI rank (cmake -DCUDA=TRUE -DMPI=TRUE
 -DPYTHON=TRUE, bound to libquick_mpi_cuda).  Run INSIDE mpiexec, with at least
 as many visible GPUs as ranks:
 
-    CUDA_VISIBLE_DEVICES=0,1 mpiexec -n 2 python -m mpi4py -m pytest test_pyquick_gpu_mpi.py -q
+    PYQUICK_MODE=gpu_mpi CUDA_VISIBLE_DEVICES=0,1 mpiexec -n 2 python -m mpi4py -m pytest test_pyquick_gpu_mpi.py -q
 
 Every rank runs the whole file.  The module is skipped on any other build
 (serial, CPU MPI, single GPU).  test_pyquick_mpi.py and test_pyquick_api.py also
@@ -25,11 +25,13 @@ import numpy as np
 
 import pytest
 
-pyquick = pytest.importorskip("pyquick")
+from pyquick_test_mode import import_pyquick  # noqa: E402
+
+pyquick = import_pyquick()     # PYQUICK_MODE picks the engine (pyquick_test_mode.py)
 
 if not (getattr(pyquick, "gpu_enabled", lambda: False)()
         and getattr(pyquick, "mpi_enabled", lambda: False)()):
-    pytest.skip("pyquick was not built for GPU + MPI (-DCUDA=TRUE -DMPI=TRUE)",
+    pytest.skip("not the GPU-MPI mode: set PYQUICK_MODE=gpu_mpi",
                 allow_module_level=True)
 
 from mpi4py import MPI  # noqa: E402

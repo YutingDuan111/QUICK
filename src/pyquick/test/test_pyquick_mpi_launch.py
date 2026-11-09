@@ -5,21 +5,21 @@ own `mpiexec` in a subprocess:
     python -m pytest test_pyquick_mpi_launch.py -q
 
 Requirements:
-  * the pyquick that `python` imports is the MPI build (cmake -DMPI=TRUE);
-    otherwise the whole file is skipped;
+  * PYQUICK_MODE=mpi (or gpu_mpi), and that engine in the install;
   * `mpiexec` on PATH.
 
 Optional environment variables:
   PYQUICK_MPIEXEC     launcher command, default "mpiexec".  On a machine with
                       fewer cores than ranks, Open MPI needs
                       "mpiexec --oversubscribe".
-  PYQUICK_SERIAL_LIB  the `lib` directory of a SERIAL pyquick install; enables
-                      test_task_farm_example (task farming needs the serial build).
-  PYQUICK_NGPUS       GPU-MPI build only: number of GPUs the launched jobs may use.
+  PYQUICK_MODE        mpi or gpu_mpi: the engine the launched jobs import
+                      (pyquick.mpi or pyquick.gpu_mpi); any other mode skips
+                      this file.
+  PYQUICK_NGPUS       gpu_mpi only: number of GPUs the launched jobs may use.
                       Default: the entries of CUDA_VISIBLE_DEVICES, else the GPUs
                       `nvidia-smi -L` lists.
 
-On a GPU-MPI build (one GPU per rank) the rank counts are capped at the number
+In the gpu_mpi mode (one GPU per rank) the rank counts are capped at the number
 of GPUs, energies are compared to 1e-6 Ha (GPU sums use atomics) instead of
 1e-8, and test_more_ranks_than_gpus_share_them checks ranks sharing a GPU.
 
@@ -41,6 +41,8 @@ import textwrap
 
 import pytest
 
+from pyquick_test_mode import mode, module_name
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MPIEXEC = shlex.split(os.environ.get("PYQUICK_MPIEXEC", "mpiexec"))
 TIMEOUT = 300                       # seconds for one launched job
@@ -58,20 +60,11 @@ def _clean_env(**extra):
     return env
 
 
-def _build_flags(pythonpath=None):
-    """Ask a fresh interpreter which pyquick it imports: {'mpi': bool, 'gpu': bool},
-    or None when pyquick does not import."""
-    env = _clean_env()
-    if pythonpath:
-        env["PYTHONPATH"] = pythonpath + os.pathsep + env.get("PYTHONPATH", "")
-    code = ("import json, pyquick; print(json.dumps({"
-            "'mpi': getattr(pyquick, 'mpi_enabled', lambda: False)(), "
-            "'gpu': getattr(pyquick, 'gpu_enabled', lambda: False)()}))")
-    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                       env=env, timeout=120)
-    if p.returncode != 0:
-        return None
-    return json.loads(p.stdout.strip().splitlines()[-1])
+def _engine_imports(module):
+    """True if a fresh interpreter can import *module* (its engine is built)."""
+    p = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True,
+                       text=True, env=_clean_env(), timeout=120)
+    return p.returncode == 0
 
 
 def _visible_gpus():
@@ -94,10 +87,14 @@ if any(k in os.environ for k in ('OMPI_COMM_WORLD_SIZE', 'PMIX_RANK', 'PMI_RANK'
                 allow_module_level=True)
 if shutil.which(MPIEXEC[0]) is None:
     pytest.skip(f"{MPIEXEC[0]} not on PATH", allow_module_level=True)
-BUILD = _build_flags()
-if not (BUILD and BUILD["mpi"]):
-    pytest.skip("the pyquick on PYTHONPATH is not an MPI build", allow_module_level=True)
-GPU = BUILD["gpu"]                       # GPU-MPI build: one GPU per rank
+MODE = mode()
+if MODE not in ('mpi', 'gpu_mpi'):
+    pytest.skip("launcher tests need an MPI mode: set PYQUICK_MODE=mpi or gpu_mpi",
+                allow_module_level=True)
+MODULE = module_name()                   # pyquick.mpi or pyquick.gpu_mpi
+if not _engine_imports(MODULE):
+    pytest.skip(f"this install has no {MODE} engine", allow_module_level=True)
+GPU = MODE == 'gpu_mpi'                  # one GPU per rank
 NGPU = _visible_gpus() if GPU else 0
 TOL_RANKS = 1e-6 if GPU else 1e-8        # energy agreement across rank counts (Ha)
 
@@ -105,7 +102,8 @@ TOL_RANKS = 1e-6 if GPU else 1e-8        # energy agreement across rank counts (
 WATER = "O -0.33840 0.00380 0.23923\nH -0.33510 -0.00190 -0.83277\nH 0.67350 -0.00190 0.59353"
 
 ENERGY_SCRIPT = textwrap.dedent(f"""
-    import json, pyquick
+    import json
+    import {MODULE} as pyquick
     out = {{}}
     for method in ('HF', 'B3LYP'):
         calc = pyquick.PyQuick(method, '6-31G*', log=False,
@@ -170,7 +168,7 @@ def test_engine_error_aborts_without_hanging(tmp_path):
     subprocess's timeout turns a hang into a test failure instead of a stuck run.
     """
     script = textwrap.dedent(f"""
-        import pyquick
+        import {MODULE} as pyquick
         r = pyquick.PyQuick('HF', 'NOT-A-REAL-BASIS', log=False).get_energy({WATER!r})
         print('RESULT unexpectedly finished', r.total_energy)
     """)
@@ -183,16 +181,10 @@ def test_engine_error_aborts_without_hanging(tmp_path):
 
 
 def test_task_farm_example(tmp_path):
-    """The build guide's task-farming script (serial build) under mpiexec -n 2."""
-    serial_lib = os.environ.get("PYQUICK_SERIAL_LIB")
-    if not serial_lib:
-        pytest.skip("set PYQUICK_SERIAL_LIB to a serial pyquick install's lib directory")
-    flags = _build_flags(serial_lib)
-    assert flags and not flags["mpi"], "PYQUICK_SERIAL_LIB must point at a SERIAL build"
-    env = {"PYTHONPATH": serial_lib + os.pathsep + os.environ.get("PYTHONPATH", "")}
-
+    """The build guide's task-farming script (pyquick.serial, one calculation per
+    rank) under mpiexec -n 2, from the same install as the MPI engine."""
     farm = open(os.path.join(HERE, "mpi_task_farm_example.py")).read()
-    proc = _launch(tmp_path, farm, nranks=2, env_extra=env)
+    proc = _launch(tmp_path, farm, nranks=2)
     assert proc.returncode == 0, proc.stderr[-2000:]
     farmed = dict(l.split()[1:] for l in proc.stdout.splitlines() if l.startswith("RESULT "))
     assert sorted(farmed) == sorted(["STO-3G", "3-21G", "6-31G", "6-31G*"])
@@ -205,7 +197,7 @@ def test_task_farm_example(tmp_path):
             e = pyquick.PyQuick(method="HF", basis=b, log=False).get_energy(W).total_energy
             print(f"RESULT {b} {e:.10f}")
     """)
-    ref = _launch(tmp_path, check, nranks=None, env_extra=env)
+    ref = _launch(tmp_path, check, nranks=None)
     assert ref.returncode == 0, ref.stderr[-2000:]
     serial = dict(l.split()[1:] for l in ref.stdout.splitlines() if l.startswith("RESULT "))
     for basis, energy in serial.items():

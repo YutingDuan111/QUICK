@@ -7,11 +7,17 @@ the total energy matches the saved reference within the standard energy
 tolerance used by the QUICK test harness (4.0e-5 Ha).
 """
 
+import importlib
 import math
+import os
 import sys
 
+# PYQUICK_MODE picks the engine, as in the pytest files (pyquick_test_mode.py):
+# serial (default), mpi, gpu or gpu_mpi. runtest sets it for each kind of run.
+MODULES = {'serial': 'pyquick', 'mpi': 'pyquick.mpi',
+           'gpu': 'pyquick.gpu', 'gpu_mpi': 'pyquick.gpu_mpi'}
 try:
-    import pyquick
+    pyquick = importlib.import_module(MODULES[os.environ.get('PYQUICK_MODE', 'serial')])
 except ImportError as e:
     print(f"FAIL  cannot import pyquick: {e}", file=sys.stderr)
     sys.exit(1)
@@ -45,5 +51,6 @@ assert len(result.mulliken) == 3, "FAIL  expected 3 Mulliken charges"
 assert abs(float(sum(result.mulliken))) < 1.0e-3, \
     f"FAIL  Mulliken charges should sum to ~0 for neutral H2O, got {sum(result.mulliken)}"
 
-print(f"PASS  total_energy = {result.total_energy:.9f} Ha  "
-      f"(ref {REF_ENERGY:.9f}, diff {diff:.2e})")
+if pyquick.mpi_rank() == 0:
+    print(f"PASS  total_energy = {result.total_energy:.9f} Ha  "
+          f"(ref {REF_ENERGY:.9f}, diff {diff:.2e})")

@@ -2,10 +2,11 @@
 MPI-specific tests for pyquick, run INSIDE mpiexec with the MPI build
 (cmake -DMPI=TRUE -DPYTHON=TRUE):
 
-    mpiexec -n 2 python -m mpi4py -m pytest test_pyquick_mpi.py -q
-    mpiexec -n 4 python -m mpi4py -m pytest test_pyquick_mpi.py -q
+    PYQUICK_MODE=mpi mpiexec -n 2 python -m mpi4py -m pytest test_pyquick_mpi.py -q
+    PYQUICK_MODE=mpi mpiexec -n 4 python -m mpi4py -m pytest test_pyquick_mpi.py -q
 
-Every rank runs the whole file.  The module is skipped on a serial or GPU build.
+Every rank runs the whole file.  Run it with PYQUICK_MODE=mpi (or gpu_mpi);
+any other mode skips it.
 
 What the existing test_pyquick_api.py (also run under mpiexec) cannot see, and
 this file checks:
@@ -30,10 +31,12 @@ import numpy as np
 
 import pytest
 
-pyquick = pytest.importorskip("pyquick")
+from pyquick_test_mode import import_pyquick  # noqa: E402
+
+pyquick = import_pyquick()     # PYQUICK_MODE picks the engine (pyquick_test_mode.py)
 
 if not (hasattr(pyquick, "mpi_enabled") and pyquick.mpi_enabled()):
-    pytest.skip("pyquick was not built with MPI (-DMPI=TRUE)", allow_module_level=True)
+    pytest.skip("not an MPI mode: set PYQUICK_MODE=mpi or gpu_mpi", allow_module_level=True)
 
 from mpi4py import MPI  # noqa: E402  (only after the skip: serial builds may lack mpi4py)
 

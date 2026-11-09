@@ -19,7 +19,9 @@ import numpy as np
 
 import pytest
 
-pyquick = pytest.importorskip("pyquick")
+from pyquick_test_mode import import_pyquick  # noqa: E402
+
+pyquick = import_pyquick()     # PYQUICK_MODE picks the engine (pyquick_test_mode.py)
 
 
 WATER = """
@@ -714,8 +716,9 @@ def test_impossible_multiplicity_raises_not_exits():
     must catch it first and raise ValueError.  Run in a subprocess so a
     failure here cannot take down the test session."""
     import subprocess, sys, textwrap
+    from pyquick_test_mode import module_name
     code = textwrap.dedent(f'''
-        import pyquick
+        import {module_name()} as pyquick
         try:
             pyquick.PyQuick('HF', 'STO-3G', mult=2, log=False).get_energy({WATER!r})
         except ValueError as e:
