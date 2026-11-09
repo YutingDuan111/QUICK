@@ -1125,13 +1125,31 @@ check_mpi_gpu_mismatch()
 }
 
 
-# Function to check if the pyquick Python interface is importable.
-# Returns 1 (skip) if the interface is not available, 0 (run) if it is.
+# Function to print the pyquick engine (PYQUICK_MODE) matching the current
+# build type: serial, mpi, gpu or gpu_mpi.
+#
+# arguments: (none)
+pyquick_mode()
+{
+    case "$buildtype" in
+      mpi)              echo 'mpi' ;;
+      cuda|hip)         echo 'gpu' ;;
+      cudampi|hipmpi)   echo 'gpu_mpi' ;;
+      *)                echo 'serial' ;;
+    esac
+}
+
+
+# Function to check if the pyquick engine for the current build type is
+# importable (pyquick.serial, .mpi, .gpu or .gpu_mpi).
+# Returns 1 (skip) if it is not available, 0 (run) if it is.
 #
 # arguments: (none)
 check_python_error()
 {
-    python3 -c "import pyquick" > /dev/null 2>&1
+    pyq_mode=`pyquick_mode`
+    # importing the engine module loads the engine (plain pyquick would not)
+    python3 -c "import pyquick.$pyq_mode" > /dev/null 2>&1
     if [ "$?" -ne 0 ]; then ret=1; else ret=0; fi
 
     return "$ret"
@@ -1173,7 +1191,7 @@ run_pyquick_test()
   echo "$2" | tee -a "$6"
 
   if [ "$check_python_error_ret" -eq 1 ]; then
-    echo "SKIPPED (Python interface not built)." | tee -a "$6"
+    echo "SKIPPED (pyquick `pyquick_mode` engine not built)." | tee -a "$6"
     echo "==============================================================" | tee -a "$6"
     echo "" | tee -a "$6"
     unlock_file "$6"
@@ -1181,10 +1199,17 @@ run_pyquick_test()
   fi
   unlock_file "$6"
 
-  # Run the Python test script
+  # Run the Python test script with the engine matching this build type;
+  # the MPI engines run under DO_PARALLEL, as quick.MPI does
   rm -f "$1.py.tmp"
-  python3 "$5/$1.py" > "$1.py.tmp" 2>&1
+  export PYQUICK_MODE=`pyquick_mode`
+  if [ $buildtype = 'mpi' ] || [ $buildtype = 'cudampi' ] || [ $buildtype = 'hipmpi' ] && [ $ismpirun = 'yes' ]; then
+    eval "$DO_PARALLEL python3 -m mpi4py $5/$1.py" > "$1.py.tmp" 2>&1
+  else
+    python3 "$5/$1.py" > "$1.py.tmp" 2>&1
+  fi
   pyexe_ret="$?"
+  unset PYQUICK_MODE
 
   lock_file "$7"
   echo "Test $3 of $4" >> "$7"
@@ -1458,7 +1483,7 @@ if [ -n "$PARALLEL_TEST_COUNT" ]; then
   export -f set_job_gpus set_test run_test run_test_api run_energy_test run_grad_test run_opt_test run_api_test \
 	  run_chk_test run_esp_test run_pyquick_test check_chk check_energy check_gradient check_opt \
           check_esp_charge check_esp_grid check_vdw_surface check_dipole \
-          clean_up check_f_error check_hdf5_error check_mpi_gpu_mismatch check_python_error lock_file unlock_file
+          clean_up check_f_error check_hdf5_error check_mpi_gpu_mismatch check_python_error pyquick_mode lock_file unlock_file
 fi
 
 #  !---------------------------------------------------------------------!

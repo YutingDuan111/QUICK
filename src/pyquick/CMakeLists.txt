@@ -88,30 +88,28 @@ execute_process(
         "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'), end='')"
     OUTPUT_VARIABLE PYTHON_EXT_SUFFIX)
 
-set(_PYQUICK_SO "${CMAKE_CURRENT_BINARY_DIR}/_pyquick${PYTHON_EXT_SUFFIX}")
-
 # ---------------------------------------------------------------------------
-# 4. Select the libquick flavour to bind against: GPU + MPI (one GPU per
-#    rank), GPU, MPI (CPU) or serial (CPU), in that order of precedence.
+# 4. The engines.  pyquick.f90 is compiled once per QUICK library the build
+#    makes, and the import a script uses picks one (src/pyquick/__init__.py):
 #
-#    pyquick.f90 carries GPU code inside #if defined(GPU) guards (mirroring
-#    main.f90). The GPU macro is what src/CMakeLists.txt defines on
-#    libquick_${QUICK_GPU_TARGET_NAME}, and it covers BOTH the cuda and hip
-#    backends -- one source, two build recipes. So a GPU pyquick differs from
-#    the CPU one only in these three things:
+#      serial   libquick             always            import pyquick
+#      mpi      libquick_mpi         -DMPI=TRUE        import pyquick.mpi
+#      gpu      libquick_cuda/_hip   -DCUDA/-DHIP      import pyquick.gpu
+#      gpu_mpi  libquick_mpi_cuda    both              import pyquick.gpu_mpi
 #
-#      * -DGPU on the Fortran compile, to activate the guarded blocks;
-#      * the .mod directory (quick/cuda or quick/hip, not quick/serial), which
-#        is where the gpu_* interfaces live;
-#      * linking libquick_cuda / libquick_hip instead of the serial libquick.
+#    pyquick.f90 carries its GPU and MPI code inside #if guards (mirroring
+#    main.f90), so an engine differs from the serial one only in its defines,
+#    the .mod directory of its library (where the gpu_* and MPI interfaces
+#    live), the library it links, and the CUDA/MPI link arguments.  GPU covers
+#    both the cuda and hip backends: HIP=TRUE flips QUICK_GPU_TARGET_NAME to
+#    "hip" and QUICK_GPU_PLATFORM to "HIP".
 #
 #    -cpp and -I<src/util> are unconditional: the guards must be *evaluated*
 #    even on the CPU build (where they evaluate to nothing), and preprocessing
 #    means "#include util.fh" now has to be resolved by cpp rather than by
 #    gfortran's own include handling.
 # ---------------------------------------------------------------------------
-set(_PYQUICK_F90FLAGS "-cpp -I${CMAKE_SOURCE_DIR}/src/util")
-set(_PYQUICK_EXTRA_LINK_ARGS "")
+set(_PYQUICK_BASE_F90FLAGS "-cpp -I${CMAKE_SOURCE_DIR}/src/util")
 
 # Link pieces shared by the flavours below.
 macro(_pyquick_add_cuda_link_args)
@@ -170,49 +168,13 @@ macro(_pyquick_add_mpi_args)
     list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
 endmacro()
 
-# CUDA=TRUE covers both GPU backends; HIP=TRUE additionally flips
-# QUICK_GPU_TARGET_NAME to "hip" and QUICK_GPU_PLATFORM to "HIP".
-if(CUDA AND MPI)
-    # GPU + MPI: one GPU per rank -- QUICK's MPIV_GPU path, as in
-    # quick.cuda.MPI. libquick_mpi_cuda is a copy of libquick_mpi with the GPU
-    # sources, so MPIV holds there too and pyquick's CPU-MPI blocks apply
-    # unchanged; MPIV_GPU adds the per-rank device start-up and the uploads.
-    set(_PYQUICK_LIBTARGET libquick_mpi_${QUICK_GPU_TARGET_NAME})
-    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/mpi_${QUICK_GPU_TARGET_NAME}")
-    set(_PYQUICK_LIBNAME "quick_mpi_${QUICK_GPU_TARGET_NAME}")
-    string(APPEND _PYQUICK_F90FLAGS " -DMPIV -DMPIV_GPU -D${QUICK_GPU_PLATFORM}_MPIV")
-    _pyquick_add_cuda_link_args()
-    _pyquick_add_mpi_args()
-    message(STATUS "pyquick: binding against multi-GPU MPI libquick (${_PYQUICK_LIBNAME})")
-elseif(CUDA)
-    set(_PYQUICK_LIBTARGET libquick_${QUICK_GPU_TARGET_NAME})
-    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/${QUICK_GPU_TARGET_NAME}")
-    set(_PYQUICK_LIBNAME "quick_${QUICK_GPU_TARGET_NAME}")
-    string(APPEND _PYQUICK_F90FLAGS " -DGPU -D${QUICK_GPU_PLATFORM}")
-    _pyquick_add_cuda_link_args()
-    message(STATUS "pyquick: binding against GPU libquick (${_PYQUICK_LIBNAME})")
-elseif(MPI)
-    # MPI (CPU): bind libquick_mpi, whose MPIV code path QUICK runs across all
-    # ranks of MPI_COMM_WORLD.
-    set(_PYQUICK_LIBTARGET libquick_mpi)
-    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/mpi")
-    set(_PYQUICK_LIBNAME "quick_mpi")
-    string(APPEND _PYQUICK_F90FLAGS " -DMPIV")
-    _pyquick_add_mpi_args()
-    message(STATUS "pyquick: binding against MPI libquick (${_PYQUICK_LIBNAME})")
-else()
-    set(_PYQUICK_LIBTARGET libquick)
-    set(_PYQUICK_MODDIR "${CMAKE_BINARY_DIR}/amber-modules/quick/serial")
-    set(_PYQUICK_LIBNAME "quick")
-    message(STATUS "pyquick: binding against serial libquick (CPU)")
-endif()
-
 # ---------------------------------------------------------------------------
-# 5. Build the .so via f2py as a custom command
+# 5. One engine: build its .so via f2py and install it into
+#    <prefix>/lib/pyquick/_engines/<mode>/.
 #
-#    Include path: build-tree .mod files for the selected libquick target,
+#    Include path: build-tree .mod files for the engine's libquick target,
 #    set by config_module_dirs(...) in src/CMakeLists.txt and fully populated
-#    once that library has compiled (hence DEPENDS ${_PYQUICK_LIBTARGET}).
+#    once that library has compiled (hence DEPENDS <library target>).
 #
 #    Link path: resolved at build time via $<TARGET_FILE_DIR:...>, so -L always
 #    points at the actual library location regardless of CMAKE_INSTALL_PREFIX.
@@ -221,35 +183,81 @@ endif()
 #    removed on Python 3.12+ and is already broken on 3.9 with modern numpy
 #    (numpy.distutils imports distutils.msvccompiler, which no longer exists),
 #    so meson is the portable choice. Requires meson + ninja (checked above).
+#
+#    Each engine builds in its own directory (f2py's meson build tree lives in
+#    the working directory).  MAKEFLAGS is cleared because a parallel make
+#    passes its jobserver to the ninja that f2py starts, without the file
+#    descriptors that go with it ("Could not initialize jobserver").
 # ---------------------------------------------------------------------------
-add_custom_command(
-    OUTPUT  "${_PYQUICK_SO}"
-    COMMAND ${Python3_EXECUTABLE} -m numpy.f2py
-                --backend meson
-                -c "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
-                "--f90flags=${_PYQUICK_F90FLAGS}"
-                "-I${_PYQUICK_MODDIR}"
-                "-L$<TARGET_FILE_DIR:${_PYQUICK_LIBTARGET}>"
-                "-l${_PYQUICK_LIBNAME}"
-                ${_PYQUICK_EXTRA_LINK_ARGS}
-                -m _pyquick
-    DEPENDS ${_PYQUICK_LIBTARGET} "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-    COMMENT "Building _pyquick Python extension via f2py"
-    VERBATIM)
+set(_PYQUICK_ENGINE_SOS "")
+
+function(_pyquick_add_engine mode libtarget libname moddir defines use_cuda use_mpi)
+    set(_PYQUICK_EXTRA_LINK_ARGS "")
+    if(use_cuda)
+        _pyquick_add_cuda_link_args()
+    endif()
+    if(use_mpi)
+        _pyquick_add_mpi_args()
+    endif()
+    set(_workdir "${CMAKE_CURRENT_BINARY_DIR}/${mode}")
+    set(_so "${_workdir}/_pyquick${PYTHON_EXT_SUFFIX}")
+    file(MAKE_DIRECTORY "${_workdir}")
+    add_custom_command(
+        OUTPUT  "${_so}"
+        COMMAND ${CMAKE_COMMAND} -E env --unset=MAKEFLAGS --unset=MFLAGS
+                ${Python3_EXECUTABLE} -m numpy.f2py
+                    --backend meson
+                    -c "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
+                    "--f90flags=${_PYQUICK_BASE_F90FLAGS}${defines}"
+                    "-I${CMAKE_BINARY_DIR}/amber-modules/quick/${moddir}"
+                    "-L$<TARGET_FILE_DIR:${libtarget}>"
+                    "-l${libname}"
+                    ${_PYQUICK_EXTRA_LINK_ARGS}
+                    -m _pyquick
+        DEPENDS ${libtarget} "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
+        WORKING_DIRECTORY "${_workdir}"
+        COMMENT "Building the ${mode} pyquick engine via f2py"
+        VERBATIM)
+    install(FILES "${_so}" DESTINATION lib/pyquick/_engines/${mode})
+    set(_PYQUICK_ENGINE_SOS ${_PYQUICK_ENGINE_SOS} "${_so}" PARENT_SCOPE)
+    message(STATUS "pyquick: ${mode} engine, bound to lib${libname}")
+endfunction()
+
+_pyquick_add_engine(serial libquick quick serial "" FALSE FALSE)
+if(MPI)
+    # MPI (CPU): libquick_mpi, whose MPIV code path QUICK runs across all
+    # ranks of MPI_COMM_WORLD.
+    _pyquick_add_engine(mpi libquick_mpi quick_mpi mpi " -DMPIV" FALSE TRUE)
+endif()
+if(CUDA)
+    _pyquick_add_engine(gpu libquick_${QUICK_GPU_TARGET_NAME} quick_${QUICK_GPU_TARGET_NAME}
+        ${QUICK_GPU_TARGET_NAME} " -DGPU -D${QUICK_GPU_PLATFORM}" TRUE FALSE)
+endif()
+if(CUDA AND MPI)
+    # GPU + MPI: one GPU per rank -- QUICK's MPIV_GPU path, as in
+    # quick.cuda.MPI. libquick_mpi_cuda is a copy of libquick_mpi with the GPU
+    # sources, so MPIV holds there too and pyquick's CPU-MPI blocks apply
+    # unchanged; MPIV_GPU adds the per-rank device start-up and the uploads.
+    _pyquick_add_engine(gpu_mpi libquick_mpi_${QUICK_GPU_TARGET_NAME}
+        quick_mpi_${QUICK_GPU_TARGET_NAME} mpi_${QUICK_GPU_TARGET_NAME}
+        " -DMPIV -DMPIV_GPU -D${QUICK_GPU_PLATFORM}_MPIV" TRUE TRUE)
+endif()
 
 # ---------------------------------------------------------------------------
-# 6. Named target included in the default ALL build
+# 6. Named target included in the default ALL build: every engine
 # ---------------------------------------------------------------------------
-add_custom_target(pyquick ALL DEPENDS "${_PYQUICK_SO}")
+add_custom_target(pyquick ALL DEPENDS ${_PYQUICK_ENGINE_SOS})
 
 # ---------------------------------------------------------------------------
-# 7. Install rules
-#    Both the compiled extension and the Python package glue go into
-#    <prefix>/lib/pyquick/ so that after "source quick.rc" (which prepends
-#    <prefix>/lib to PYTHONPATH) the package is importable as "import pyquick".
+# 7. Install the Python package next to the engines, in <prefix>/lib/pyquick/,
+#    so that after "source quick.rc" (which prepends <prefix>/lib to
+#    PYTHONPATH) "import pyquick" works.
 # ---------------------------------------------------------------------------
-install(FILES "${_PYQUICK_SO}"
-        DESTINATION lib/pyquick)
-install(FILES "${CMAKE_SOURCE_DIR}/src/pyquick/__init__.py"
+install(FILES
+            "${CMAKE_SOURCE_DIR}/src/pyquick/__init__.py"
+            "${CMAKE_SOURCE_DIR}/src/pyquick/_api.py"
+            "${CMAKE_SOURCE_DIR}/src/pyquick/serial.py"
+            "${CMAKE_SOURCE_DIR}/src/pyquick/mpi.py"
+            "${CMAKE_SOURCE_DIR}/src/pyquick/gpu.py"
+            "${CMAKE_SOURCE_DIR}/src/pyquick/gpu_mpi.py"
         DESTINATION lib/pyquick)
