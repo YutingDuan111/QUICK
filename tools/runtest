@@ -32,6 +32,13 @@ qbasisdir="$installdir/basis"
 qbindir="$installdir/bin"
 export QUICK_HOME="$installdir"
 
+# pyquick (Python tests): this install's package and the libquick* its
+# engines load.  Set here, not left to quick.rc, because macOS drops
+# DYLD_LIBRARY_PATH when it starts /bin/bash.
+export PYTHONPATH="$installdir/lib${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="$installdir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export DYLD_LIBRARY_PATH="$installdir/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+
 # executables
 qexe=''
 buildtypes=''
@@ -389,13 +396,16 @@ get_total_tests()
     tot_esp_tests=0 
   fi
 
-  if [ "$7" = 'yes' ]; then
-    pyq_tests=(`grep "^pyq_" "$test_list" | awk '{print $1}'`)
+  # Python tests count when this build type's pyquick engine is installed; an
+  # engine that is installed but does not import then fails the test, with the
+  # Python error in the verbose log
+  if [ "$7" = 'yes' ] && [ -d "$installdir/lib/pyquick/_engines/`pyquick_mode`" ]; then
+    pyq_tests=(`grep "^pyquick_" "$test_list" | awk '{print $1}'`)
     tot_pyq_tests="${#pyq_tests[@]}"
     tests+=(${pyq_tests[@]})
     while IFS= read -r line; do
         test_names+=("$line")
-    done < <(grep "^pyq_" "$test_list" | awk 'BEGIN { FS=" #"; OFS="\n"; } {print $2}')
+    done < <(grep "^pyquick_" "$test_list" | awk 'BEGIN { FS=" #"; OFS="\n"; } {print $2}')
   else
     tot_pyq_tests=0
   fi
@@ -1054,7 +1064,7 @@ print_summary()
         elif [ `sed -n '/execution failed/p' .quick.runtest.${buildtype}.summary.tmp2 | wc -l` -gt 0 ]; then
           failed_esp=$(($failed_esp+1))
         fi
-      elif [ `sed -n '/Python interface test/p' .quick.runtest.${buildtype}.summary.tmp2 | wc -l` -gt 0 ]; then
+      elif [ `sed -n '/Python interface (pyquick)/p' .quick.runtest.${buildtype}.summary.tmp2 | wc -l` -gt 0 ]; then
         if [ `sed -n '/possible FAILURE/p' .quick.runtest.${buildtype}.summary.tmp2 | wc -l` -gt 0 ]; then
           failed_pyq=$(($failed_pyq+1))
         fi
@@ -1140,22 +1150,6 @@ pyquick_mode()
 }
 
 
-# Function to check if the pyquick engine for the current build type is
-# importable (pyquick.serial, .mpi, .gpu or .gpu_mpi).
-# Returns 1 (skip) if it is not available, 0 (run) if it is.
-#
-# arguments: (none)
-check_python_error()
-{
-    pyq_mode=`pyquick_mode`
-    # importing the engine module loads the engine (plain pyquick would not)
-    python3 -c "import pyquick.$pyq_mode" > /dev/null 2>&1
-    if [ "$?" -ne 0 ]; then ret=1; else ret=0; fi
-
-    return "$ret"
-}
-
-
 # Function to skip tests if the code wasnt compiled with HDF5 support
 #
 # arguments:
@@ -1173,7 +1167,7 @@ check_hdf5_error()
 # wrapper function for Python interface (pyquick) tests.
 #
 # arguments:
-#   $1: test stem (e.g. pyq_ene_H2O_rhf_sto3g)
+#   $1: test stem (e.g. pyquick_test)
 #   $2: test name/description
 #   $3: test number for this test
 #   $4: total number of tests
@@ -1183,20 +1177,9 @@ check_hdf5_error()
 #   $8: job slot (GNU parallel) (1-based indexing)
 run_pyquick_test()
 {
-  check_python_error
-  check_python_error_ret="$?"
-
   lock_file "$6"
   echo "Running test $3 of $4" | tee -a "$6"
   echo "$2" | tee -a "$6"
-
-  if [ "$check_python_error_ret" -eq 1 ]; then
-    echo "SKIPPED (pyquick `pyquick_mode` engine not built)." | tee -a "$6"
-    echo "==============================================================" | tee -a "$6"
-    echo "" | tee -a "$6"
-    unlock_file "$6"
-    return
-  fi
   unlock_file "$6"
 
   # Run the Python test script with the engine matching this build type;
@@ -1483,7 +1466,7 @@ if [ -n "$PARALLEL_TEST_COUNT" ]; then
   export -f set_job_gpus set_test run_test run_test_api run_energy_test run_grad_test run_opt_test run_api_test \
 	  run_chk_test run_esp_test run_pyquick_test check_chk check_energy check_gradient check_opt \
           check_esp_charge check_esp_grid check_vdw_surface check_dipole \
-          clean_up check_f_error check_hdf5_error check_mpi_gpu_mismatch check_python_error pyquick_mode lock_file unlock_file
+          clean_up check_f_error check_hdf5_error check_mpi_gpu_mismatch pyquick_mode lock_file unlock_file
 fi
 
 #  !---------------------------------------------------------------------!
@@ -1658,7 +1641,14 @@ for buildtype in $buildtypes; do
   fi
 
   # Run Python interface (pyquick) tests
-  if [ "$test_pyq" = 'yes' ]; then
+  if [ "$test_pyq" = 'yes' ] && [ "$tot_pyq_tests" -eq 0 ]; then
+    if [ -d "$installdir/lib/pyquick" ]; then
+      pyq_why="no pyquick `pyquick_mode` engine in this install"
+    else
+      pyq_why="pyquick is not built (configure with -DPYTHON=TRUE)"
+    fi
+    echo "Python interface (pyquick) tests not run: $pyq_why." | tee -a $QUICK_HOME/.quick.${buildtype}.runtest.log
+  elif [ "$test_pyq" = 'yes' ]; then
     tc_start=$(($tc_end+1))
     tc_end=$(($tc_end+$tot_pyq_tests))
     if [ $has_parallel = 'no' ]; then

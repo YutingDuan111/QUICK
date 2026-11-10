@@ -581,20 +581,36 @@ jobs:
             echo "CMake version:"
             cmake --version
           fi
+      - name: 'Set up Python for pyquick'
+        if: matrix.python-version
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 'Install numpy, mpi4py and pytest for pyquick'
+        if: matrix.python-version
+        run: |
+          python3 -m pip install "numpy==${{ matrix.numpy-version }}.*" meson ninja pytest
+          # mpi4py must use the same MPI library as libquick_mpi, so build it from source
+          MPICC=$(which mpicc) python3 -m pip install --no-binary=mpi4py mpi4py
       - name: 'Configure MPI Version'
         run: |
           mkdir build
+          # pyquick is built in jobs that set python-version
+          PYQUICK=""
+          if [ -n "${{ matrix.python-version }}" ]; then
+            PYQUICK="-DPYTHON=TRUE -DPython3_EXECUTABLE=$(which python3)"
+          fi
           cd build
           if [ ${{ matrix.compiler-type }} == 'INTELLLVM' ]; then
             source /opt/intel/oneapi/setvars.sh
             cmake .. -DCOMPILER=${{ matrix.compiler-type }} \
               -DMPI=TRUE -DENABLEF=TRUE -DHDF5=${{ matrix.hdf5-restart-support }} \
-              -DCMAKE_INSTALL_PREFIX=$PWD/../install \
+              -DCMAKE_INSTALL_PREFIX=$PWD/../install $PYQUICK \
               -DMKL_HOME=$MKLROOT -DMKL_MULTI_THREADED=FALSE -DTRUST_SYSTEM_LIBS=TRUE
           else
             cmake .. -DCOMPILER=${{ matrix.compiler-type }} \
               -DMPI=TRUE -DENABLEF=TRUE -DHDF5=${{ matrix.hdf5-restart-support }} \
-              -DCMAKE_INSTALL_PREFIX=$PWD/../install
+              -DCMAKE_INSTALL_PREFIX=$PWD/../install $PYQUICK
           fi
       - name: 'Build and Install MPI Version Using 2 Jobs'
         run: |
@@ -611,41 +627,6 @@ jobs:
           fi
           cd install
           ./runtest --mpi --full
-      - name: 'Set up Python for pyquick'
-        if: matrix.python-version
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: 'Install numpy, mpi4py and pytest for pyquick'
-        if: matrix.python-version
-        run: |
-          python3 -m pip install "numpy==${{ matrix.numpy-version }}.*" meson ninja pytest
-          # mpi4py must use the same MPI library as libquick_mpi, so build it from source
-          MPICC=$(which mpicc) python3 -m pip install --no-binary=mpi4py mpi4py
-      - name: 'Build and install pyquick Python extension (MPI)'
-        if: matrix.python-version
-        run: |
-          cd build
-          cmake .. -DPYTHON=TRUE -DPython3_EXECUTABLE=$(which python3)
-          cmake --build . --parallel 2 --target pyquick
-          cmake --install .
-      - name: 'Run pyquick MPI tests Using 2 MPI Processes'
-        if: matrix.python-version
-        run: |
-          export PYTHONPATH=$PWD/install/lib${PYTHONPATH:+:$PYTHONPATH}
-          if [ "$RUNNER_OS" == "macOS" ]; then
-            export DYLD_LIBRARY_PATH=$PWD/install/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}
-          fi
-          # runners have 3-4 cores; the launcher tests also use 3 and 4 ranks
-          export PYQUICK_MPIEXEC="mpiexec --oversubscribe"
-          cd src/pyquick/test
-          # one install, two engines: serial (import pyquick) and MPI (pyquick.mpi)
-          python3 -m pytest test_pyquick_modes.py -q -p no:cacheprovider
-          export PYQUICK_MODE=mpi
-          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py ../../../test/pyq_ene_H2O_rhf_sto3g.py
-          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py -m pytest test_pyquick_api.py test_pyquick_xyz.py -q -p no:cacheprovider
-          $PYQUICK_MPIEXEC -n 2 python3 -m mpi4py -m pytest test_pyquick_mpi.py -q -p no:cacheprovider
-          python3 -m pytest test_pyquick_mpi_launch.py -q -p no:cacheprovider
       - name: 'Upload Test Artifacts for MPI Version'
         if: always()
         uses: actions/upload-artifact@v4

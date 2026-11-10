@@ -22,3 +22,7 @@ src/pyquick/test/output/
 .ipynb_checkpoints/
 .DS_Store
 ai-content/
+
+# pyquick development tests: kept locally, not in the public repo
+# (the public smoke test and core tests are test/pyquick_test.py)
+src/pyquick/test/
