@@ -376,6 +376,16 @@ contains
         integer :: ierr
 
         ierr = 0
+
+        ! QUICK holds one molecule at a time. Finalizing an open persistent job
+        ! here would free its state behind the Job's back (and, on GPU, leave its
+        ! device context to be freed twice at job_close), so refuse instead.
+        if (job_open_flag) then
+            call fail('job_run: a Job is open; call job.delete() (or leave its ' // &
+                      'with-block) before get_energy, get_grad or geo_opt')
+            return
+        end if
+
         job_has_trajectory = .false.
 
         ! --- decide the log open mode before finalize clears job_active ---
@@ -663,6 +673,7 @@ contains
         use quick_method_module, only : upload
 #endif
         integer, intent(in) :: do_log
+        external :: finalize
         integer :: ierr
 
         ierr = 0
@@ -670,6 +681,18 @@ contains
         if (job_open_flag) then
             call fail('job_open: a job is already open; call job_close first')
             return
+        end if
+
+        ! a one-shot run (job_run) keeps QUICK allocated until the next run;
+        ! finalize it first, as job_run does for a previous run. job_run has
+        ! already freed its own GPU context (gpu_delete).
+        if (job_active) then
+            call finalize(iOutFile, ierr, 1)
+            if (ierr /= 0) then
+                call fail('job_open: finalize of the previous run failed')
+                return
+            end if
+            job_active = .false.
         end if
 
         ! GRADIENT makes getMol size quick_qm_struct%gradient; individual steps
