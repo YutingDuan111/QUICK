@@ -29,7 +29,7 @@ endif()
 message(STATUS "pyquick: using Python interpreter: ${Python3_EXECUTABLE}")
 
 # ---------------------------------------------------------------------------
-# 2. Verify numpy and f2py are available via the located interpreter
+# 2. Verify numpy (which ships f2py) is available via the located interpreter
 # ---------------------------------------------------------------------------
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import numpy; print(numpy.__version__)"
@@ -55,17 +55,6 @@ if(_numpy_version VERSION_LESS 2.0)
         "without -DPYTHON=TRUE.")
 endif()
 message(STATUS "pyquick: using numpy ${_numpy_version}")
-
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -m numpy.f2py -h
-    RESULT_VARIABLE _f2py_result
-    OUTPUT_QUIET
-    ERROR_QUIET)
-if(NOT _f2py_result EQUAL 0)
-    message(FATAL_ERROR
-        "f2py not found (numpy.f2py unavailable for ${Python3_EXECUTABLE}). "
-        "Install numpy to build the Python extension, or reconfigure without -DPYTHON=TRUE.")
-endif()
 
 # f2py is driven with its meson backend (see the build command below), which
 # needs the meson and ninja executables on PATH. Check now for a clear error.
@@ -111,7 +100,7 @@ execute_process(
 # ---------------------------------------------------------------------------
 set(_PYQUICK_BASE_F90FLAGS "-cpp -I${CMAKE_SOURCE_DIR}/src/util")
 
-# Link pieces shared by the flavours below.
+# Extra f2py arguments (-I include dirs, -L/-l link flags) shared by the engines below.
 macro(_pyquick_add_cuda_link_args)
     if(NOT HIP)
         # libquick_cuda is a shared library, so cublas/cusolver/cudart are
@@ -122,19 +111,19 @@ macro(_pyquick_add_cuda_link_args)
         foreach(_cudalib "${CUDA_CUDART_LIBRARY}" "${CUDA_cublas_LIBRARY}" "${CUDA_cusolver_LIBRARY}")
             if(_cudalib)
                 get_filename_component(_cudalibdir "${_cudalib}" DIRECTORY)
-                list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_cudalibdir}")
+                list(APPEND _PYQUICK_EXTRA_ARGS "-L${_cudalibdir}")
             endif()
         endforeach()
-        list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
-        list(APPEND _PYQUICK_EXTRA_LINK_ARGS -lcudart -lcublas -lcusolver)
+        list(REMOVE_DUPLICATES _PYQUICK_EXTRA_ARGS)
+        list(APPEND _PYQUICK_EXTRA_ARGS -lcudart -lcublas -lcusolver)
     endif()
 endmacro()
 
 macro(_pyquick_add_mpi_args)
     # pyquick.f90's own MPI blocks sit behind #ifdef MPIV and call MPI directly
     # (use mpi), so the compile needs the MPI Fortran module directory and the
-    # link the MPI Fortran libraries. Python owns MPI through mpi4py (see
-    # __init__.py), so mpi4py must be importable -- and built against this
+    # link the MPI Fortran libraries. Python owns MPI through mpi4py (see _bind
+    # in _api.py), so mpi4py must be importable -- and built against this
     # same MPI library.
     execute_process(
         COMMAND ${Python3_EXECUTABLE} -c "import mpi4py"
@@ -155,17 +144,17 @@ macro(_pyquick_add_mpi_args)
     # loads, so they are left out; the Fortran bindings (mpi_mpifh, ...) and
     # libmpi are what pyquick.f90 calls.
     foreach(_mpiinc ${MPI_Fortran_INCLUDE_DIRS} ${MPI_Fortran_MODULE_DIR})
-        list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-I${_mpiinc}")
+        list(APPEND _PYQUICK_EXTRA_ARGS "-I${_mpiinc}")
     endforeach()
     foreach(_mpilib ${MPI_Fortran_LIBRARIES})
         get_filename_component(_mpilibdir "${_mpilib}" DIRECTORY)
         get_filename_component(_mpilibname "${_mpilib}" NAME_WE)
         string(REGEX REPLACE "^lib" "" _mpilibname "${_mpilibname}")
         if(_mpilibname MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
-            list(APPEND _PYQUICK_EXTRA_LINK_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
+            list(APPEND _PYQUICK_EXTRA_ARGS "-L${_mpilibdir}" "-l${_mpilibname}")
         endif()
     endforeach()
-    list(REMOVE_DUPLICATES _PYQUICK_EXTRA_LINK_ARGS)
+    list(REMOVE_DUPLICATES _PYQUICK_EXTRA_ARGS)
 endmacro()
 
 # ---------------------------------------------------------------------------
@@ -192,7 +181,7 @@ endmacro()
 set(_PYQUICK_ENGINE_SOS "")
 
 function(_pyquick_add_engine mode libtarget libname moddir defines use_cuda use_mpi)
-    set(_PYQUICK_EXTRA_LINK_ARGS "")
+    set(_PYQUICK_EXTRA_ARGS "")
     if(use_cuda)
         _pyquick_add_cuda_link_args()
     endif()
@@ -212,7 +201,7 @@ function(_pyquick_add_engine mode libtarget libname moddir defines use_cuda use_
                     "-I${CMAKE_BINARY_DIR}/amber-modules/quick/${moddir}"
                     "-L$<TARGET_FILE_DIR:${libtarget}>"
                     "-l${libname}"
-                    ${_PYQUICK_EXTRA_LINK_ARGS}
+                    ${_PYQUICK_EXTRA_ARGS}
                     -m _pyquick
         DEPENDS ${libtarget} "${CMAKE_SOURCE_DIR}/src/pyquick/pyquick.f90"
         WORKING_DIRECTORY "${_workdir}"

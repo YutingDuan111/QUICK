@@ -1,7 +1,6 @@
 module pyquick
 
 #include "util.fh"
-    use iso_fortran_env, only : output_unit
     use quick_molspec_module, only : quick_molspec, natom, xyz, alloc
     use quick_calculated_module, only : quick_qm_struct
     use quick_method_module, only : quick_method
@@ -23,7 +22,6 @@ module pyquick
     use quick_grad_cshell_module, only : cshell_gradient
     use quick_grad_oshell_module, only : oshell_gradient
     use quick_optimizer_module, only : lopt
-    use quick_exception_module, only : get_exception_message
     use quick_molsurface_module, only : generate_MKS_surfaces
     use quick_oeproperties_module, only : compute_esp, compute_ESP_charge, esp_charges
     use quick_mpi_module, only : master, quick_comm_rank, quick_comm_size, libMPIMode
@@ -32,9 +30,9 @@ module pyquick
 
     private
     public :: set_calc, set_basis, set_method, clear_methods, read_geom, &
-              had_error, error_message, print_input, input_string, &
+              had_error, error_message, input_string, &
               set_point_charges, clear_point_charges, &
-              job_run, job_destroy, job_set_output, &
+              job_run, job_set_output, &
               job_open, job_step, job_close, &
               job_active, &
               job_total_energy, job_e_core, job_e_electronic, &
@@ -43,7 +41,7 @@ module pyquick
               job_has_dispersion, job_has_extcharge, job_has_gradient, &
               job_has_mulliken, job_has_lowdin, job_has_mo_energies, job_has_density_matrix, &
               job_get_mulliken, job_get_lowdin, job_get_mo_energies, job_get_density_matrix, &
-              job_get_gradients, job_get_geometry, job_exception_message, &
+              job_get_gradients, job_get_geometry, &
               job_has_esp, job_get_esp_charges, &
               job_has_ptchg_gradient, job_get_point_charge_gradient, &
               job_nbasis, job_nmo, job_nelec_alpha, job_nelec_beta, &
@@ -95,7 +93,7 @@ module pyquick
     ! .true. while QUICK itself is running (from initialize1 to the end of a
     ! job_run / job_open / job_step). Under MPI, a failure in that window may
     ! hit one rank only while the others wait in a collective call, so fail()
-    ! aborts every rank instead of returning (see fail).
+    ! aborts every rank.
     logical :: engine_running = .false.
 
     ! scalar results (always available after a successful job_run)
@@ -161,7 +159,7 @@ module pyquick
 contains
 
     ! -----------------------------------------------------------------------
-    ! Backward-compatible input-assembly API
+    ! Input assembly: calc, basis, keywords and geometry, set from Python
     ! -----------------------------------------------------------------------
 
     subroutine set_calc(keyword)
@@ -317,47 +315,12 @@ contains
 
     end subroutine read_geom
 
-    subroutine print_input()
-        write(output_unit, '(A)') trim(input_string)
-    end subroutine print_input
-
     subroutine rebuild_input()
         character(len=:), allocatable :: text
         character(len=64) :: atom_line
         integer :: i
 
-        if (has_calc) then
-            text = trim(calc_keyword)
-        else
-            text = ''
-        end if
-
-        if (allocated(method_list)) then
-            do i = 1, size(method_list)
-                if (len_trim(text) > 0) then
-                    if (len_trim(method_list(i)%arg) > 0) then
-                        text = trim(text) // ' ' // trim(method_list(i)%keyword) &
-                               // '=' // trim(method_list(i)%arg)
-                    else
-                        text = trim(text) // ' ' // trim(method_list(i)%keyword)
-                    end if
-                else
-                    if (len_trim(method_list(i)%arg) > 0) then
-                        text = trim(method_list(i)%keyword) // '=' // trim(method_list(i)%arg)
-                    else
-                        text = trim(method_list(i)%keyword)
-                    end if
-                end if
-            end do
-        end if
-
-        if (has_basis) then
-            if (len_trim(text) > 0) then
-                text = trim(text) // ' ' // trim(basis_token)
-            else
-                text = trim(basis_token)
-            end if
-        end if
+        text = keyword_text()
 
         if (has_geom) then
             do i = 1, geom_natom
@@ -397,28 +360,20 @@ contains
         ! max_cycles: for jobtype 2 only -- <= 0 uses DEFAULT_OPT_CYCLES; > 0 emits
         !          OPTIMIZE=<n> to cap the number of optimization cycles.
 #if defined(GPU) || defined(MPIV_GPU)
-        ! GPU builds only: the basis arrays the uploads need. Compiled out on the
-        ! CPU build (needs the build to preprocess this file: -cpp, and -DGPU for
-        ! GPU builds).
-        use quick_basis_module, only : aexp, cutprim, dcoeff, jbasis, jshell, maxcontract, &
-                                       ncontract, nprim, nshell, Ycutoff
+        ! GPU builds only. Compiled out on the CPU build (needs the build to
+        ! preprocess this file: -cpp, and -DGPU for GPU builds).
         use quick_method_module, only : upload
 #endif
         integer, intent(in) :: jobtype
         integer, intent(in) :: do_log
         integer, intent(in) :: max_cycles
         ! External free subroutines in libquick.so
-        external :: initialize1, read_Job_and_Atom, getMol, getEnergy, dipole
-        external :: finalize, dl_find
+        external :: getEnergy, finalize, dl_find
 
-        character(len=:), allocatable :: keyword_line
-        character(len=10) :: kwlen_str
+        character(len=:), allocatable :: extra_keywords
         character(len=12) :: cyc_str
         character(len=1) :: open_mode
-        integer :: ierr, i, j, k
-        integer :: natm_type
-        integer :: atm_type_id(geom_natom)
-        logical :: new_type
+        integer :: ierr
 
         ierr = 0
         job_has_trajectory = .false.
@@ -443,164 +398,31 @@ contains
             job_active = .false.
         end if
 
-        ! --- validate prerequisites ---
-        if (.not. has_calc) then
-            call fail('job_run: call set_calc before run')
-            return
-        end if
-        if (.not. has_basis) then
-            call fail('job_run: call set_basis before run')
-            return
-        end if
-        if (.not. has_geom) then
-            call fail('job_run: call read_geom before run')
-            return
-        end if
-
-        ! --- build keyword line ---
-        keyword_line = build_keyword_line()
-
-        ! for a gradient job, add the GRADIENT keyword so read_Job_and_Atom sets
-        ! quick_method%grad before getMol allocates quick_qm_struct%gradient
-        if (jobtype == 1) keyword_line = trim(keyword_line) // ' GRADIENT'
-
-        ! for an optimization, OPTIMIZE sets quick_method%opt (and %grad). The cycle
-        ! cap is always explicit: it sizes the trajectory storage (a bare OPTIMIZE
-        ! would leave iopt=0). The optimizer is QUICK's default (DL-Find) unless the
-        ! user added the LOPT keyword (Cartesian).
+        ! for a gradient job, GRADIENT makes read_Job_and_Atom set quick_method%grad
+        ! before getMol allocates quick_qm_struct%gradient. For an optimization,
+        ! OPTIMIZE sets quick_method%opt (and %grad); its cycle cap is always
+        ! explicit because it sizes the trajectory storage (a bare OPTIMIZE would
+        ! leave iopt=0). The optimizer is QUICK's default (DL-Find) unless the user
+        ! added the LOPT keyword (Cartesian).
+        extra_keywords = ''
+        if (jobtype == 1) extra_keywords = ' GRADIENT'
         if (jobtype == 2) then
             if (max_cycles > 0) then
                 write(cyc_str, '(I0)') max_cycles
             else
                 write(cyc_str, '(I0)') DEFAULT_OPT_CYCLES
             end if
-            keyword_line = trim(keyword_line) // ' OPTIMIZE=' // trim(cyc_str)
+            extra_keywords = ' OPTIMIZE=' // trim(cyc_str)
         end if
 
-        ! --- guard against silent Fortran truncation on assignment to quick_api%Keywd ---
-        if (len_trim(keyword_line) > KEYWORD_LEN) then
-            write(kwlen_str, '(I0)') KEYWORD_LEN
-            call fail('job_run: keyword line exceeds maximum length of ' // &
-                      trim(kwlen_str) // ' characters')
-            return
-        end if
-
-        ! --- configure quick_api for keyword injection ---
-        quick_api%apiMode  = .true.
-        quick_api%hasKeywd = .true.
-        quick_api%Keywd    = trim(keyword_line)
-
-        ! --- configure file names; isTemplate suppresses coord read in getMol ---
-        inFileName = trim(output_stem) // '.in'
-        isTemplate = .true.
-
-        ! --- QUICK call chain (follows main.f90) ---
-        engine_running = .true.
-        call initialize1(ierr)
-        if (ierr /= 0) then
-            call fail('job_run: initialize1 failed')
-            return
-        end if
-        call reset_engine_state()
-
-        ! --- QUICK's diagnostic log: rank 0 only, as in main.f90. MPI worker
-        ! ranks get the null device, so a stray write never creates a file ---
-        if (master) then
-            call open_log('job_run', do_log, open_mode)
-        else
-            call open_null_log('job_run')
-        end if
+        call setup_molecule('job_run', extra_keywords, do_log, open_mode)
         if (had_error) return
-
-#if defined(GPU)
-        ! --- GPU: create context and pick a device (mirrors main.f90) ---
-        call gpu_new(ierr)
-        call gpu_init_device(ierr)
-        call gpu_write_info(iOutFile, ierr)
-#elif defined(MPIV_GPU)
-        ! --- multi-GPU: one device per rank (main.f90's MPIV_GPU branch) ---
-        call start_mgpu('job_run')
-        if (had_error) return
-#endif
-
-        ! reads keyword from quick_api%Keywd; skips coordinate read (apiMode)
-        call read_Job_and_Atom(ierr)
-        if (ierr /= 0) then
-            call fail('job_run: read_Job_and_Atom failed')
-            return
-        end if
-
-        ! set natom (module-level target) BEFORE alloc uses it
-        natom = geom_natom
-        call prepare_point_charges()
-
-        call alloc(quick_molspec, quick_method%readxyz, ierr)
-        if (ierr /= 0) then
-            call fail('job_run: alloc(quick_molspec) failed')
-            return
-        end if
-        call inject_point_charges()
-
-        ! --- inject geometry into QUICK module-level state ---
-
-        ! build atom type list (deduplicate by atomic number)
-        natm_type = 0
-        atm_type_id = 0
-        do i = 1, geom_natom
-            new_type = .true.
-            do k = 1, natm_type
-                if (atm_type_id(k) == geom_atnum(i)) then
-                    new_type = .false.
-                    exit
-                end if
-            end do
-            if (new_type) then
-                natm_type = natm_type + 1
-                atm_type_id(natm_type) = geom_atnum(i)
-            end if
-        end do
-
-        quick_molspec%iAtomType = natm_type
-        quick_molspec%atom_type_sym = '  '   ! drop entries left by the previous molecule
-        do i = 1, natm_type
-            quick_molspec%atom_type_sym(i) = SYMBOL(atm_type_id(i))
-        end do
-
-        ! inject atomic numbers and coordinates (convert Angstrom -> Bohr)
-        do i = 1, geom_natom
-            quick_molspec%iattype(i) = geom_atnum(i)
-            do j = 1, 3
-                xyz(j, i) = geom_coords(j, i) * A_TO_BOHRS
-            end do
-        end do
-        quick_molspec%xyz => xyz
-
-        ! --- initial guess ---
-        if (quick_method%SAD) then
-            call getSadGuess(ierr)
-            if (ierr /= 0) then
-                call fail('job_run: getSadGuess failed')
-                return
-            end if
-        end if
-
-        ! --- build molecular orbital / basis information ---
-        call getMol(ierr)
-        if (ierr /= 0) then
-            call fail('job_run: getMol failed')
-            return
-        end if
 
 #if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: allocate scratch, upload method + molecule/coords ---
         call gpu_allocate_scratch(quick_method%grad .or. quick_method%opt)
         call upload(quick_method, ierr)
-        if (.not. quick_method%opt) then
-            call gpu_setup(natom, nbasis, quick_molspec%nElec, quick_molspec%imult, &
-                           quick_molspec%molchg, quick_molspec%iAtomType)
-            call gpu_upload_xyz(xyz)
-            call gpu_upload_atom_and_chg(quick_molspec%iattype, quick_molspec%chg)
-        end if
+        if (.not. quick_method%opt) call gpu_upload_geometry()
 #endif
 
         ! --- ERI precomputables and cutoff screening ---
@@ -609,20 +431,7 @@ contains
 
 #if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: upload basis + Schwarz cutoffs (needs the arrays just built) ---
-        if (.not. quick_method%opt) then
-            call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
-                ncontract, itype, aexp, dcoeff, &
-                quick_basis%first_basis_function, quick_basis%last_basis_function, &
-                quick_basis%first_shell_basis_function, quick_basis%last_shell_basis_function, &
-                quick_basis%ncenter, quick_basis%kstart, quick_basis%katom, &
-                quick_basis%ktype, quick_basis%kprim, quick_basis%kshell, quick_basis%Ksumtype, &
-                quick_basis%Qnumber, quick_basis%Qstart, quick_basis%Qfinal, &
-                quick_basis%Qsbasis, quick_basis%Qfbasis, &
-                quick_basis%gccoeff, quick_basis%cons, quick_basis%gcexpo, quick_basis%KLMN)
-            call gpu_upload_cutoff_matrix(Ycutoff, cutPrim)
-            call gpu_upload_oei(quick_molspec%nExtAtom, quick_molspec%extxyz, &
-                                quick_molspec%extchg, ierr)
-        end if
+        if (.not. quick_method%opt) call gpu_upload_basis_and_cutoffs()
 #endif
 
         ! QUICK sets Exc only on the DFT path; reset it so an HF run after a DFT
@@ -694,19 +503,17 @@ contains
 
     end subroutine job_run
 
-    ! -----------------------------------------------------------------------
-    ! Persistent job: set up once (job_open), run many geometries of the same
-    ! molecule (job_step, reusing the density), then free everything (job_close).
-    ! -----------------------------------------------------------------------
-
-    subroutine job_open(do_log)
-        ! One-time setup for a fixed molecule. Prerequisites (as for job_run):
-        ! set_calc, set_basis and read_geom (the initial geometry) must be done.
-        ! do_log: 1 = write <stem>.out, 0 = null device.
-#if defined(GPU) || defined(MPIV_GPU)
-        use quick_method_module, only : upload
-#endif
+    subroutine setup_molecule(caller, extra_keywords, do_log, open_mode)
+        ! The setup job_run and job_open share, following main.f90: check the
+        ! prerequisites, hand QUICK the keyword line (plus extra_keywords, e.g.
+        ! ' GRADIENT'), start QUICK (log, GPU device), allocate the molecule,
+        ! inject the atoms and coordinates, and build the basis (getMol).
+        ! open_mode: 'R' replaces the log, 'A' appends to it. Errors go through
+        ! fail(); the caller checks had_error.
+        character(len=*), intent(in) :: caller
+        character(len=*), intent(in) :: extra_keywords
         integer, intent(in) :: do_log
+        character(len=1), intent(in) :: open_mode
         external :: initialize1, read_Job_and_Atom, getMol
 
         character(len=:), allocatable :: keyword_line
@@ -716,24 +523,20 @@ contains
         logical :: new_type
 
         ierr = 0
-        job_has_trajectory = .false.
-        if (job_open_flag) then
-            call fail('job_open: a job is already open; call job_close first')
-            return
-        end if
-        if (.not. has_calc)  then; call fail('job_open: call set_calc before'); return; end if
-        if (.not. has_basis) then; call fail('job_open: call set_basis before'); return; end if
-        if (.not. has_geom)  then; call fail('job_open: call read_geom before'); return; end if
+        if (.not. has_calc)  then; call fail(caller // ': call set_calc first');  return; end if
+        if (.not. has_basis) then; call fail(caller // ': call set_basis first'); return; end if
+        if (.not. has_geom)  then; call fail(caller // ': call read_geom first'); return; end if
 
-        ! Append GRADIENT so getMol sizes quick_qm_struct%gradient; individual
-        ! steps then opt into a gradient without re-running getMol.
-        keyword_line = trim(build_keyword_line()) // ' GRADIENT'
+        ! guard against silent Fortran truncation on assignment to quick_api%Keywd
+        keyword_line = trim(build_keyword_line()) // extra_keywords
         if (len_trim(keyword_line) > KEYWORD_LEN) then
             write(kwlen_str, '(I0)') KEYWORD_LEN
-            call fail('job_open: keyword line exceeds ' // trim(kwlen_str) // ' characters')
+            call fail(caller // ': keyword line exceeds maximum length of ' // &
+                      trim(kwlen_str) // ' characters')
             return
         end if
 
+        ! keyword injection; isTemplate suppresses the coordinate read in getMol
         quick_api%apiMode  = .true.
         quick_api%hasKeywd = .true.
         quick_api%Keywd    = trim(keyword_line)
@@ -742,38 +545,41 @@ contains
 
         engine_running = .true.
         call initialize1(ierr)
-        if (ierr /= 0) then; call fail('job_open: initialize1 failed'); return; end if
+        if (ierr /= 0) then; call fail(caller // ': initialize1 failed'); return; end if
         call reset_engine_state()
 
-        ! log on rank 0 only; MPI workers write to the null device (see job_run)
+        ! QUICK's diagnostic log: rank 0 only, as in main.f90. MPI worker ranks
+        ! get the null device, so a stray write never creates a file
         if (master) then
-            call open_log('job_open', do_log, 'R')
+            call open_log(caller, do_log, open_mode)
         else
-            call open_null_log('job_open')
+            call open_null_log(caller)
         end if
         if (had_error) return
 
 #if defined(GPU)
-        ! --- GPU: create context and pick a device (mirrors job_run) ---
+        ! GPU: create the context and pick a device (mirrors main.f90)
         call gpu_new(ierr)
         call gpu_init_device(ierr)
         call gpu_write_info(iOutFile, ierr)
 #elif defined(MPIV_GPU)
-        ! --- multi-GPU: one device per rank (main.f90's MPIV_GPU branch) ---
-        call start_mgpu('job_open')
+        ! multi-GPU: one device per rank (main.f90's MPIV_GPU branch)
+        call start_mgpu(caller)
         if (had_error) return
 #endif
 
+        ! reads the keywords from quick_api%Keywd; skips the coordinate read (apiMode)
         call read_Job_and_Atom(ierr)
-        if (ierr /= 0) then; call fail('job_open: read_Job_and_Atom failed'); return; end if
+        if (ierr /= 0) then; call fail(caller // ': read_Job_and_Atom failed'); return; end if
 
+        ! natom (module-level target) must be set before alloc uses it
         natom = geom_natom
         call prepare_point_charges()
         call alloc(quick_molspec, quick_method%readxyz, ierr)
-        if (ierr /= 0) then; call fail('job_open: alloc(quick_molspec) failed'); return; end if
+        if (ierr /= 0) then; call fail(caller // ': alloc(quick_molspec) failed'); return; end if
         call inject_point_charges()
 
-        ! atom types (deduplicate by atomic number) + initial coordinates
+        ! atom types (deduplicated by atomic number)
         natm_type = 0
         atm_type_id = 0
         do i = 1, geom_natom
@@ -788,6 +594,8 @@ contains
         do i = 1, natm_type
             quick_molspec%atom_type_sym(i) = SYMBOL(atm_type_id(i))
         end do
+
+        ! atomic numbers and coordinates (Angstrom -> Bohr)
         do i = 1, geom_natom
             quick_molspec%iattype(i) = geom_atnum(i)
             do j = 1, 3
@@ -796,12 +604,78 @@ contains
         end do
         quick_molspec%xyz => xyz
 
+        ! initial guess, then the molecular orbital / basis information
         if (quick_method%SAD) then
             call getSadGuess(ierr)
-            if (ierr /= 0) then; call fail('job_open: getSadGuess failed'); return; end if
+            if (ierr /= 0) then; call fail(caller // ': getSadGuess failed'); return; end if
         end if
         call getMol(ierr)
-        if (ierr /= 0) then; call fail('job_open: getMol failed'); return; end if
+        if (ierr /= 0) then; call fail(caller // ': getMol failed'); return; end if
+    end subroutine setup_molecule
+
+    ! GPU uploads shared by job_run and job_step. Both routines exist in every
+    ! build -- only their bodies are guarded (see set_mpi).
+
+    subroutine gpu_upload_geometry()
+        ! Molecule sizes, coordinates, atom types and charges.
+#if defined(GPU) || defined(MPIV_GPU)
+        call gpu_setup(natom, nbasis, quick_molspec%nElec, quick_molspec%imult, &
+                       quick_molspec%molchg, quick_molspec%iAtomType)
+        call gpu_upload_xyz(xyz)
+        call gpu_upload_atom_and_chg(quick_molspec%iattype, quick_molspec%chg)
+#endif
+    end subroutine gpu_upload_geometry
+
+    subroutine gpu_upload_basis_and_cutoffs()
+        ! Basis, Schwarz cutoffs and one-electron (point-charge) data. Needs
+        ! getEriPrecomputables and schwarzoff to have run.
+#if defined(GPU) || defined(MPIV_GPU)
+        use quick_basis_module, only : aexp, cutprim, dcoeff, jbasis, jshell, maxcontract, &
+                                       ncontract, nprim, nshell, Ycutoff
+        integer :: ierr
+
+        ierr = 0
+        call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
+            ncontract, itype, aexp, dcoeff, &
+            quick_basis%first_basis_function, quick_basis%last_basis_function, &
+            quick_basis%first_shell_basis_function, quick_basis%last_shell_basis_function, &
+            quick_basis%ncenter, quick_basis%kstart, quick_basis%katom, &
+            quick_basis%ktype, quick_basis%kprim, quick_basis%kshell, quick_basis%Ksumtype, &
+            quick_basis%Qnumber, quick_basis%Qstart, quick_basis%Qfinal, &
+            quick_basis%Qsbasis, quick_basis%Qfbasis, &
+            quick_basis%gccoeff, quick_basis%cons, quick_basis%gcexpo, quick_basis%KLMN)
+        call gpu_upload_cutoff_matrix(Ycutoff, cutPrim)
+        call gpu_upload_oei(quick_molspec%nExtAtom, quick_molspec%extxyz, &
+                            quick_molspec%extchg, ierr)
+#endif
+    end subroutine gpu_upload_basis_and_cutoffs
+
+    ! -----------------------------------------------------------------------
+    ! Persistent job: set up once (job_open), run many geometries of the same
+    ! molecule (job_step, reusing the density), then free everything (job_close).
+    ! -----------------------------------------------------------------------
+
+    subroutine job_open(do_log)
+        ! One-time setup for a fixed molecule. Prerequisites (as for job_run):
+        ! set_calc, set_basis and read_geom (the initial geometry) must be done.
+        ! do_log: 1 = write <stem>.out, 0 = null device.
+#if defined(GPU) || defined(MPIV_GPU)
+        use quick_method_module, only : upload
+#endif
+        integer, intent(in) :: do_log
+        integer :: ierr
+
+        ierr = 0
+        job_has_trajectory = .false.
+        if (job_open_flag) then
+            call fail('job_open: a job is already open; call job_close first')
+            return
+        end if
+
+        ! GRADIENT makes getMol size quick_qm_struct%gradient; individual steps
+        ! then opt into a gradient without re-running getMol.
+        call setup_molecule('job_open', ' GRADIENT', do_log, 'R')
+        if (had_error) return
 
 #if defined(GPU) || defined(MPIV_GPU)
         ! --- GPU: allocate persistent scratch (always gradient-capable -- job_step
@@ -823,11 +697,6 @@ contains
         ! coordinates (same atoms). want_gradient: 1 = also compute the gradient.
         ! getMol is NOT called, so quick_qm_struct%dense from the previous step
         ! survives and seeds this SCF.
-#if defined(GPU) || defined(MPIV_GPU)
-        use quick_basis_module, only : aexp, cutprim, dcoeff, jbasis, jshell, maxcontract, &
-                                       ncontract, nprim, nshell, Ycutoff
-        use quick_method_module, only : upload
-#endif
         integer, intent(in) :: want_gradient
         integer :: ierr, i, j
 
@@ -864,22 +733,8 @@ contains
         ! distances, Gaussian product centers), so this must repeat every step,
         ! not just once in job_open -- see quick_api_module's run_quick, which
         ! does the same full re-upload unconditionally on every call. ---
-        call gpu_setup(natom, nbasis, quick_molspec%nElec, quick_molspec%imult, &
-                       quick_molspec%molchg, quick_molspec%iAtomType)
-        call gpu_upload_xyz(xyz)
-        call gpu_upload_atom_and_chg(quick_molspec%iattype, quick_molspec%chg)
-        call gpu_upload_basis(nshell, nprim, jshell, jbasis, maxcontract, &
-            ncontract, itype, aexp, dcoeff, &
-            quick_basis%first_basis_function, quick_basis%last_basis_function, &
-            quick_basis%first_shell_basis_function, quick_basis%last_shell_basis_function, &
-            quick_basis%ncenter, quick_basis%kstart, quick_basis%katom, &
-            quick_basis%ktype, quick_basis%kprim, quick_basis%kshell, quick_basis%Ksumtype, &
-            quick_basis%Qnumber, quick_basis%Qstart, quick_basis%Qfinal, &
-            quick_basis%Qsbasis, quick_basis%Qfbasis, &
-            quick_basis%gccoeff, quick_basis%cons, quick_basis%gcexpo, quick_basis%KLMN)
-        call gpu_upload_cutoff_matrix(Ycutoff, cutPrim)
-        call gpu_upload_oei(quick_molspec%nExtAtom, quick_molspec%extxyz, &
-                            quick_molspec%extchg, ierr)
+        call gpu_upload_geometry()
+        call gpu_upload_basis_and_cutoffs()
 #endif
 
         quick_qm_struct%Exc = 0.0d0   ! see job_run: QUICK sets Exc only for DFT
@@ -907,7 +762,7 @@ contains
         ! even the plain quick.cuda binary), so the fault is a host-memory
         ! corruption in the GPU code, not in pyquick. Until it is found, each step
         ! leaks its device arrays (~570 KiB/step for benzene/6-31G*), reclaimed at
-        ! job_close/job_destroy by gpu_delete's cudaDeviceReset.
+        ! job_close by gpu_delete's cudaDeviceReset.
 #endif
 
         call harvest_results(want_gradient /= 0)
@@ -916,6 +771,8 @@ contains
     end subroutine job_step
 
     subroutine job_close()
+        ! Finalize the last run (one-shot or persistent) and free QUICK's memory.
+        ! Python calls it from Job.delete, from the engine's __del__ and at exit.
         external :: finalize
         integer :: ierr
         ierr = 0
@@ -933,10 +790,8 @@ contains
     end subroutine job_close
 
     subroutine job_gpu_teardown()
-        ! Shared GPU-context teardown for job_close and job_destroy. Either one
-        ! can be the last call on an open persistent job -- job_destroy also
-        ! backstops __init__.py's PyQuick.__del__ -- so both must free the
-        ! device context, not just job_close. Mirrors quick_api_module's
+        ! GPU-context teardown of an open persistent job, for job_close (also
+        ! reached from _PyQuickEngine.__del__ in _api.py). Mirrors quick_api_module's
         ! delete_quick_job, including the libxc GPU cleanup that job_run's
         ! one-shot teardown skips (harmless there for non-DFT jobs, but a
         ! persistent job can run DFT).
@@ -1011,23 +866,9 @@ contains
         job_opt_converged = quick_qm_struct%opt_converged
     end subroutine harvest_results
 
-    subroutine job_destroy()
-        external :: finalize
-        integer :: ierr
-        ierr = 0
-        if (job_active) then
-            ! See job_close: only tear down the GPU context if a persistent job
-            ! (job_open) actually left one open.
-            if (job_open_flag) call job_gpu_teardown()
-            call finalize(iOutFile, ierr, 1)
-            job_active    = .false.
-            job_open_flag = .false.
-        end if
-    end subroutine job_destroy
-
     ! -----------------------------------------------------------------------
-    ! Array result getters
-    ! Each checks the availability flag and sets had_error if not computed.
+    ! Array result getters. Python calls each one only when its job_has_* flag
+    ! is set, so they copy the data without checking again.
     ! -----------------------------------------------------------------------
 
     subroutine run_esp_charges()
@@ -1072,11 +913,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: charges(10000)
         charges = 0.0d0
-        n = 0
-        if (.not. job_has_esp) then
-            call fail("ESP charges were not computed; request properties=['esp_charges']")
-            return
-        end if
         n = size(esp_charges)
         charges(1:n) = esp_charges
     end subroutine job_get_esp_charges
@@ -1088,12 +924,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: charges(10000)
         charges = 0.0d0
-        if (.not. job_has_mulliken) then
-            call fail("'mulliken' charges were not computed; " // &
-                      "include DIPOLE in the keyword line via set_method('DIPOLE')")
-            n = 0
-            return
-        end if
         n = natom
         charges(1:natom) = quick_qm_struct%Mulliken(1:natom)
     end subroutine job_get_mulliken
@@ -1103,12 +933,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: charges(10000)
         charges = 0.0d0
-        if (.not. job_has_lowdin) then
-            call fail("'lowdin' charges were not computed; " // &
-                      "include DIPOLE in the keyword line via set_method('DIPOLE')")
-            n = 0
-            return
-        end if
         n = natom
         charges(1:natom) = quick_qm_struct%Lowdin(1:natom)
     end subroutine job_get_lowdin
@@ -1118,11 +942,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: energies(10000)
         energies = 0.0d0
-        if (.not. job_has_mo_energies) then
-            call fail("'mo_energies' were not computed; run() must complete successfully")
-            n = 0
-            return
-        end if
         n = NBSuse
         energies(1:NBSuse) = quick_qm_struct%E(1:NBSuse)
     end subroutine job_get_mo_energies
@@ -1137,12 +956,6 @@ contains
         double precision, intent(out) :: dm(9000000)
         integer :: i, j, idx
         dm = 0.0d0
-        if (.not. job_has_density_matrix) then
-            call fail("'density_matrix' was not computed; run() must complete successfully")
-            nr = 0
-            nc = 0
-            return
-        end if
         nr = nbasis
         nc = nbasis
         do j = 1, nbasis
@@ -1159,11 +972,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: energies(10000)
         energies = 0.0d0
-        n = 0
-        if (.not. job_has_beta) then
-            call fail("'beta_mo_energies' exist only for unrestricted (open-shell) runs")
-            return
-        end if
         n = NBSuse
         energies(1:NBSuse) = quick_qm_struct%Eb(1:NBSuse)
     end subroutine job_get_beta_mo_energies
@@ -1176,12 +984,6 @@ contains
         double precision, intent(out) :: dm(9000000)
         integer :: i, j
         dm = 0.0d0
-        nr = 0
-        nc = 0
-        if (.not. job_has_beta) then
-            call fail("'beta_density_matrix' exists only for unrestricted (open-shell) runs")
-            return
-        end if
         nr = nbasis
         nc = nbasis
         do j = 1, nbasis
@@ -1352,12 +1154,6 @@ contains
         integer, intent(out) :: n
         double precision, intent(out) :: g(300000)
         g = 0.0d0
-        n = 0
-        if (.not. job_has_ptchg_gradient) then
-            call fail("the point-charge gradient was not computed; " // &
-                      "use get_grad() with point_charges")
-            return
-        end if
         n = quick_molspec%nextatom
         g(1:3*n) = quick_qm_struct%ptchg_gradient(1:3*n)
     end subroutine job_get_point_charge_gradient
@@ -1371,11 +1167,6 @@ contains
         double precision, intent(out) :: g(30000)
         integer :: i
         g = 0.0d0
-        if (.not. job_has_gradient) then
-            call fail("'gradient' was not computed; use get_grad() (not get_energy())")
-            n = 0
-            return
-        end if
         n = natom
         do i = 1, 3 * natom
             g(i) = quick_qm_struct%gradient(i)
@@ -1392,11 +1183,6 @@ contains
         double precision, intent(out) :: coords(30000)
         integer :: i, j
         coords = 0.0d0
-        if (.not. job_has_optimized) then
-            call fail("'optimized_coordinates' were not computed; use geo_opt()")
-            n = 0
-            return
-        end if
         n = natom
         do i = 1, natom
             do j = 1, 3
@@ -1473,11 +1259,14 @@ contains
         end do
     end subroutine inject_point_charges
 
-    function build_keyword_line() result(text)
+    function keyword_text() result(text)
+        ! "calc keywords BASIS=..." from what has been set so far; shared by the
+        ! input_string (rebuild_input) and the keyword line QUICK reads.
         character(len=:), allocatable :: text
         integer :: i
 
-        text = trim(calc_keyword)
+        text = ''
+        if (has_calc) text = trim(calc_keyword)
 
         if (allocated(method_list)) then
             do i = 1, size(method_list)
@@ -1491,6 +1280,15 @@ contains
         end if
 
         if (has_basis) text = trim(text) // ' ' // trim(basis_token)
+
+        text = trim(adjustl(text))
+    end function keyword_text
+
+    function build_keyword_line() result(text)
+        ! The keyword line for quick_api%Keywd: keyword_text plus EXTCHARGES.
+        character(len=:), allocatable :: text
+
+        text = keyword_text()
 
         ! EXTCHARGES makes QUICK report ECharge; the charges themselves are
         ! injected by prepare_/inject_point_charges, not read from an input file
@@ -1689,14 +1487,6 @@ contains
              action='WRITE', iostat=ios)
         if (ios /= 0) call fail(caller // ': could not open null output device')
     end subroutine open_null_log
-
-    subroutine job_exception_message(code, msg)
-        ! Expose QUICK's error text for a code, so Python can report/inspect it.
-        !f2py intent(out) msg
-        integer, intent(in) :: code
-        character(len=200), intent(out) :: msg
-        call get_exception_message(code, msg)
-    end subroutine job_exception_message
 
     function uppercase(text) result(upper)
         character(len=*), intent(in) :: text

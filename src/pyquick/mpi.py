@@ -10,8 +10,8 @@ from . import _api
 
 _api._bind('mpi')
 
-from ._api import *  # noqa: E402,F401,F403
-from ._api import __all__  # noqa: E402,F401
+from ._api import *
+from ._api import __all__
 
 
 def __getattr__(name):
