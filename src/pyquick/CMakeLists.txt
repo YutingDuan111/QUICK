@@ -56,18 +56,6 @@ if(_numpy_version VERSION_LESS 2.0)
 endif()
 message(STATUS "pyquick: using numpy ${_numpy_version}")
 
-# f2py is driven with its meson backend (see the build command below), which
-# needs the meson and ninja executables on PATH. Check now for a clear error.
-find_program(MESON_EXECUTABLE meson)
-find_program(NINJA_EXECUTABLE ninja)
-if(NOT MESON_EXECUTABLE OR NOT NINJA_EXECUTABLE)
-    message(FATAL_ERROR
-        "pyquick requires 'meson' and 'ninja' for f2py's meson build backend, "
-        "but they were not found on PATH. Install them for the build Python, e.g.\n"
-        "    ${Python3_EXECUTABLE} -m pip install meson ninja\n"
-        "then reconfigure (or pass -DPYTHON=FALSE to skip the Python extension).")
-endif()
-
 # ---------------------------------------------------------------------------
 # 3. Compute the platform-specific extension suffix
 #    e.g. .cpython-313-x86_64-linux-gnu.so

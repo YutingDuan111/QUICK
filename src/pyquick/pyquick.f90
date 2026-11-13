@@ -97,7 +97,6 @@ module pyquick
     logical :: engine_running = .false.
 
     ! scalar results (always available after a successful job_run)
-    ! job_e_core is QUICK's ECore: the core-core NUCLEAR REPULSION energy
     double precision :: job_total_energy   = 0.0d0
     double precision :: job_e_core         = 0.0d0
     double precision :: job_e_electronic   = 0.0d0
@@ -1524,32 +1523,5 @@ contains
             end select
         end do
     end function uppercase
-
-    function null_device() result(dev)
-        ! Platform-appropriate null device for discarding QUICK's log.
-        ! Detected at runtime so the choice does not depend on preprocessor
-        ! flags or a specific Fortran compiler's predefined macros:
-        !   Windows sets OS=Windows_NT and defines %WINDIR% -> use 'NUL'
-        !   Unix/macOS -> use '/dev/null'
-        character(len=:), allocatable :: dev
-        character(len=64) :: val
-        integer :: length, stat
-
-        call get_environment_variable('OS', val, length, stat)
-        if (stat == 0 .and. length > 0) then
-            if (index(uppercase(val(1:min(length, len(val)))), 'WINDOWS') > 0) then
-                dev = 'NUL'
-                return
-            end if
-        end if
-
-        call get_environment_variable('WINDIR', val, length, stat)
-        if (stat == 0 .and. length > 0) then
-            dev = 'NUL'
-            return
-        end if
-
-        dev = '/dev/null'
-    end function null_device
 
 end module pyquick
