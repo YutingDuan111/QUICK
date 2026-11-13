@@ -315,7 +315,7 @@ jobs:
             hdf5-restart-support: FALSE
             python-version: '3.12'
             numpy-version: '2.0'
-          - os: 'macos-14'
+          - os: 'macos-26'
             compiler-type: 'GNU'
             compiler-version: '15'
             c-compiler: 'gcc'
@@ -326,7 +326,7 @@ jobs:
             hdf5-restart-support: TRUE
             python-version: '3.12'
             numpy-version: '2.0'
-          - os: 'macos-14'
+          - os: 'macos-26'
             compiler-type: 'CLANG'
             compiler-version: '20'
             fortran-compiler-version: '15'

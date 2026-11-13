@@ -17,7 +17,7 @@ install was built without raises ImportError when imported.
 import os as _os
 
 from . import _api
-from ._api import read_xyz      # needs no engine
+from ._api import read_xyz
 
 __all__ = _api.__all__
 

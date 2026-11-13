@@ -37,15 +37,8 @@ _BUILT_WITH = {
 
 
 def _bind(mode):
-    """Load the *mode* engine and attach this module to it (once per process).
+    #Load the *mode* engine and attach this module to it (once per process).
 
-    MPI engines (mpi, gpu_mpi): Python owns MPI.  Importing mpi4py starts it,
-    and mpi4py finalizes it at exit.  QUICK borrows it in library mode
-    (set_mpi), the way Amber does.  Every QUICK calculation runs on all ranks
-    of MPI_COMM_WORLD; rank 0 reads the results from Fortran and broadcasts
-    them, so every rank returns the same Result.  The other engines never
-    import mpi4py.
-    """
     global _MODE, _mod, _MPI_BUILD, _GPU_BUILD, _COMM
     if _MODE == mode:
         return
@@ -127,13 +120,13 @@ def _run_due_cleanup():
     if _cleanup_due:
         _cleanup_due = False
         if _mod.job_active:
-            _mod.job_destroy()
+            _mod.job_close()
 
 
 def _mpi_exit_hook():
     # QUICK's finalize must run before mpi4py finalizes MPI; see _bind
     if _mod.job_active:
-        _mod.job_destroy()
+        _mod.job_close()
 
 
 def _checked(fn):
@@ -154,21 +147,6 @@ def _checked(fn):
 # ---------------------------------------------------------------------------
 
 class _PyQuickEngine:
-    """Object-oriented interface to a single QUICK calculation.
-
-    Usage::
-
-        job = _PyQuickEngine()
-        job.set_calc('HF')
-        job.set_basis('STO-3G')
-        job.read_geom('''
-            O  0.000  0.000  0.000
-            H  0.757  0.586  0.000
-            H -0.757  0.586  0.000
-        ''')
-        job.run()
-        print(job.total_energy)
-    """
 
     def __init__(self):
         self._calc    = None   # str, e.g. 'HF'
@@ -210,18 +188,6 @@ class _PyQuickEngine:
                 return
         self._methods.append((uname, arg))
 
-    def unset_method(self, keyword):
-        """Remove a keyword token previously added via set_method().
-
-        Raises ValueError if the keyword is not currently set.
-        """
-        uname = keyword.strip().upper()
-        for i, (k, _) in enumerate(self._methods):
-            if k == uname:
-                del self._methods[i]
-                return
-        raise ValueError(f"method keyword {keyword!r} is not set")
-
     def set_output(self, stem):
         """Set the file stem for QUICK's output (default ``'pyquick_job'``).
 
@@ -258,21 +224,10 @@ class _PyQuickEngine:
         else:
             _checked(_mod.set_point_charges)(self._point_charges.T)
 
-    def print_input(self):
-        """Print the assembled QUICK input to stdout."""
-        print(self.input_string)
-
     @property
     def input_string(self):
         """The assembled QUICK input as a string."""
-        # replay this instance's state so Fortran's input_string reflects it
-        _mod.clear_methods()
-        if self._calc  is not None: _checked(_mod.set_calc)(self._calc)
-        if self._basis is not None: _checked(_mod.set_basis)(self._basis)
-        for keyword, arg in self._methods:
-            if arg is not None: _checked(_mod.set_method)(keyword, arg)
-            else:               _checked(_mod.set_method)(keyword)
-        if self._geom  is not None: _checked(_mod.read_geom)(self._geom)
+        self._replay_setup()   # so Fortran's input_string reflects this instance
         return bytes(_mod.input_string).decode().strip()
 
     # -- execution -----------------------------------------------------------
@@ -289,8 +244,8 @@ class _PyQuickEngine:
         platform null device so the run leaves no file behind.
 
         Must be called after :meth:`set_calc`, :meth:`set_basis`, and
-        :meth:`read_geom`.  Results are snapshotted and available as properties
-        afterwards.
+        :meth:`read_geom`.  Results are snapshotted into ``_results``, which
+        :meth:`Result._from_engine` reads.
 
         If this instance has been run before, the previous QUICK state is
         fully finalized before the new run begins, so basis sets and array
@@ -299,51 +254,37 @@ class _PyQuickEngine:
         """
         self._results = {}
         self._ran = False
-        if self._calc is None:
-            raise RuntimeError("call set_calc() before run()")
-        if self._basis is None:
-            raise RuntimeError("call set_basis() before run()")
-        if self._geom is None:
-            raise RuntimeError("call read_geom() before run()")
         _run_due_cleanup()
-        # replay this instance's state into the Fortran singleton
-        _mod.clear_methods()
-        _checked(_mod.set_calc)(self._calc)
-        _checked(_mod.set_basis)(self._basis)
-        for keyword, arg in self._methods:
-            if arg is not None:
-                _checked(_mod.set_method)(keyword, arg)
-            else:
-                _checked(_mod.set_method)(keyword)
-        _checked(_mod.read_geom)(self._geom)
+        self._replay_setup()
         self._replay_point_charges()
         _checked(_mod.job_run)(jobtype, 1 if log else 0, int(max_cycles))
         self._ran = True
         self._share_results()
 
     def _replay_setup(self):
-        """Replay this instance's calc/basis/methods into the Fortran singleton."""
+        """Replay this instance's calc, basis, keywords and geometry into the
+        Fortran singleton, which another instance may have changed since.
+
+        A missing setting is left out here; job_run / job_open report it.
+        """
         _mod.clear_methods()
-        _checked(_mod.set_calc)(self._calc)
-        _checked(_mod.set_basis)(self._basis)
+        if self._calc is not None:
+            _checked(_mod.set_calc)(self._calc)
+        if self._basis is not None:
+            _checked(_mod.set_basis)(self._basis)
         for keyword, arg in self._methods:
             if arg is not None:
                 _checked(_mod.set_method)(keyword, arg)
             else:
                 _checked(_mod.set_method)(keyword)
-        self._replay_point_charges()
+        if self._geom is not None:
+            _checked(_mod.read_geom)(self._geom)
 
     def job_open(self, log=True):
         """Set up a persistent job (allocate once) on the current setup."""
-        if self._calc is None:
-            raise RuntimeError("call set_calc() before job_open()")
-        if self._basis is None:
-            raise RuntimeError("call set_basis() before job_open()")
-        if self._geom is None:
-            raise RuntimeError("call read_geom() before job_open()")
         _run_due_cleanup()
         self._replay_setup()
-        _checked(_mod.read_geom)(self._geom)
+        self._replay_point_charges()
         _checked(_mod.job_open)(1 if log else 0)
 
     def job_step(self, geometry, gradient=False):
@@ -482,170 +423,9 @@ class _PyQuickEngine:
                 if _MPI_BUILD:
                     _request_cleanup()
                 else:
-                    _mod.job_destroy()
+                    _mod.job_close()
         except Exception:
             pass
-
-    # -- scalar results ------------------------------------------------------
-
-    def _require_run(self, prop_name):
-        if not self._ran:
-            raise AttributeError(
-                f"'{prop_name}' is not available until run() has been called"
-            )
-
-    @property
-    def total_energy(self):
-        """Total SCF energy in Hartree."""
-        self._require_run('total_energy')
-        return self._results['total_energy']
-
-    @property
-    def nuclear_repulsion(self):
-        """Core-core nuclear repulsion energy in Hartree (QUICK's ECore)."""
-        self._require_run('nuclear_repulsion')
-        return self._results['nuclear_repulsion']
-
-    @property
-    def e_electronic(self):
-        """Total electronic energy in Hartree."""
-        self._require_run('e_electronic')
-        return self._results['e_electronic']
-
-    @property
-    def e_one_electron(self):
-        """One-electron energy (kinetic + nuclear-electron attraction) in Hartree."""
-        self._require_run('e_one_electron')
-        return self._results['e_one_electron']
-
-    @property
-    def e_two_electron(self):
-        """Two-electron energy (Coulomb J + exchange K combined) in Hartree.
-
-        Derived exactly as ``e_electronic - e_one_electron - e_xc``.
-        """
-        self._require_run('e_two_electron')
-        return self._results['e_two_electron']
-
-    @property
-    def e_xc(self):
-        """DFT exchange-correlation energy in Hartree (0.0 for pure HF)."""
-        self._require_run('e_xc')
-        return self._results['e_xc']
-
-    @property
-    def e_dispersion(self):
-        """Empirical dispersion correction in Hartree.
-
-        Only available when a dispersion keyword (D2/D3/D3BJ/...) was set.
-        """
-        self._require_run('e_dispersion')
-        if 'e_dispersion' not in self._results:
-            raise AttributeError(
-                "'e_dispersion' is unavailable: no dispersion correction was "
-                "requested for this job — set a dispersion keyword, e.g. "
-                "set_method('D3')"
-            )
-        return self._results['e_dispersion']
-
-    @property
-    def e_external_charge(self):
-        """Repulsion among the external point charges themselves, in Hartree.
-
-        Only available when point charges were set. This term is reported
-        separately and is never part of ``total_energy``.
-        """
-        self._require_run('e_external_charge')
-        if 'e_external_charge' not in self._results:
-            raise AttributeError(
-                "'e_external_charge' is unavailable: no point charges were set "
-                "for this job — set them via set_point_charges()"
-            )
-        return self._results['e_external_charge']
-
-    # -- array results -------------------------------------------------------
-
-    @property
-    def mulliken(self):
-        """Mulliken partial charges as a numpy array of shape (natom,).
-
-        Requires DIPOLE in the keyword line::
-
-            job.set_method('DIPOLE')
-        """
-        self._require_run('mulliken')
-        if 'mulliken' not in self._results:
-            raise AttributeError(
-                "'mulliken' charges were not computed; "
-                "include DIPOLE in the keyword line via set_method('DIPOLE')"
-            )
-        return self._results['mulliken']
-
-    @property
-    def lowdin(self):
-        """Lowdin partial charges as a numpy array of shape (natom,).
-
-        Requires DIPOLE in the keyword line::
-
-            job.set_method('DIPOLE')
-        """
-        self._require_run('lowdin')
-        if 'lowdin' not in self._results:
-            raise AttributeError(
-                "'lowdin' charges were not computed; "
-                "include DIPOLE in the keyword line via set_method('DIPOLE')"
-            )
-        return self._results['lowdin']
-
-    @property
-    def mo_energies(self):
-        """Molecular orbital energies (alpha) as a numpy array of shape (NBSuse,)."""
-        self._require_run('mo_energies')
-        if 'mo_energies' not in self._results:
-            raise AttributeError(
-                "'mo_energies' were not computed; run() must complete successfully"
-            )
-        return self._results['mo_energies']
-
-    @property
-    def density_matrix(self):
-        """Density matrix, numpy array of shape (nbasis, nbasis).
-
-        The TOTAL density on restricted runs; the ALPHA density on unrestricted
-        (open-shell) runs, where :attr:`beta_density_matrix` holds the beta part.
-        """
-        self._require_run('density_matrix')
-        if 'density_matrix' not in self._results:
-            raise AttributeError(
-                "'density_matrix' was not computed; run() must complete successfully"
-            )
-        return self._results['density_matrix']
-
-    @property
-    def dipole(self):
-        """Dipole moment vector (x, y, z) in Debye, shape (3,).
-
-        Requires DIPOLE in the keyword line via set_method('DIPOLE').
-        """
-        self._require_run('dipole')
-        if 'dipole' not in self._results:
-            raise AttributeError(
-                "'dipole' was not computed; include DIPOLE via set_method('DIPOLE')"
-            )
-        return self._results['dipole']
-
-    @property
-    def gradient(self):
-        """Nuclear gradient dE/dR, shape (natom, 3), Hartree/Bohr.
-
-        Requires a gradient run: ``run(jobtype=1)``.
-        """
-        self._require_run('gradient')
-        if 'gradient' not in self._results:
-            raise AttributeError(
-                "'gradient' was not computed; run with run(jobtype=1)"
-            )
-        return self._results['gradient']
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +560,6 @@ _SUPPORTED_PROPERTIES = {
 }
 
 # Always returned on the Result because every SCF computes them for free
-# (no extra keyword, no extra routine).  Accepted in `properties` for backward
-# compatibility, but they are a no-op there — you get them either way.
 _ALWAYS_ON_PROPERTIES = {
     'mo_energies',       # alpha MO energies
     'density_matrix',    # total (restricted) or alpha (unrestricted) density
@@ -808,16 +586,6 @@ _JOBTYPE_WORDS = {'energy', 'gradient', 'gradients', 'forces',
 _UNSUPPORTED_PROPERTIES = {
     'mp2',     # MP2 energy: not part of pyquick (decided 2026-10-19)
     'e_mp2',
-}
-
-# opt-in property name -> Result attributes it unlocks.  The conditional energies
-# (e_dispersion, e_external_charge) are gated by input keywords, not by the
-# properties list — see Result.
-_PROPERTY_ATTRS = {
-    'mulliken_charges': ('mulliken',),
-    'lowdin_charges': ('lowdin',),
-    'dipole': ('dipole',),
-    'esp_charges': ('esp_charges',),
 }
 
 # Raw QUICK keywords that pyquick replaces with its own API, or cannot support,
@@ -919,7 +687,8 @@ class PyQuick:
         Basis set name, e.g. ``'6-31G*'``.
     properties : iterable of str
         Opt-in extras to make available on the Result: ``'mulliken_charges'``,
-        ``'lowdin_charges'``, ``'dipole'`` (all need the DIPOLE keyword).  The
+        ``'lowdin_charges'``, ``'dipole'`` (these three run QUICK's DIPOLE
+        step) and ``'esp_charges'`` (ESP_CHARGE).  The
         energy breakdown, geometry, ``mo_energies`` and ``density_matrix`` are
         **always** returned (every SCF computes them for free), so they are not
         listed here; naming ``mo_energies``/``density_matrix`` is accepted but
@@ -1087,7 +856,7 @@ class PyQuick:
                 max_cycles=0 if max_cycles is None else int(max_cycles))
         return Result._from_engine(job, self, geometry, name)
 
-    def new_job(self, geometry, reuse_density=True, point_charges=None):
+    def new_job(self, geometry, point_charges=None):
         """Open a persistent :class:`Job` for one molecule.
 
         Set up the molecule and settings once, then call ``job.run(geom)`` for
@@ -1098,8 +867,7 @@ class PyQuick:
 
         *point_charges* (as for :meth:`get_energy`) is fixed for the whole job.
         """
-        return Job(self, geometry, reuse_density=reuse_density,
-                   point_charges=point_charges)
+        return Job(self, geometry, point_charges=point_charges)
 
     def copy(self):
         """Return a shallow copy, like :func:`copy.copy`.
@@ -1315,7 +1083,7 @@ class Result:
         Unrestricted (open-shell) runs only.
         """
         if 'beta_mo_energies' not in self._values:
-            raise AttributeError("'beta_mo_energies' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+            raise AttributeError("'beta_mo_energies' %s" % _BETA_ONLY)
         return self._values['beta_mo_energies']
 
     @property
@@ -1326,7 +1094,7 @@ class Result:
         the alpha density.
         """
         if 'beta_density_matrix' not in self._values:
-            raise AttributeError("'beta_density_matrix' exists only for unrestricted (open-shell) runs; on a restricted run alpha and beta are identical")
+            raise AttributeError("'beta_density_matrix' %s" % _BETA_ONLY)
         return self._values['beta_density_matrix']
 
     @property
@@ -1508,10 +1276,9 @@ class Job:
             energies = [job.run(g).total_energy for g in geometries]
     """
 
-    def __init__(self, calc, geometry, reuse_density=True, point_charges=None):
+    def __init__(self, calc, geometry, point_charges=None):
         geometry = _resolve_geometry(geometry)
         self._calc = calc
-        self._reuse_density = bool(reuse_density)   # reserved; density is reused
         self._natoms = _count_atoms(geometry)
         _check_spin(geometry, calc.charge, calc.mult)
         self._engine = calc._build_engine()
